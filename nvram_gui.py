@@ -14,7 +14,6 @@ from nvram_editor import (
     QuestionBlock,
     OPTION_LINE_PATTERN,
     VALUE_PATTERN,
-    RISKY_CONFIGURATIONS,
     validate_numeric_input,
     apply_changes,
 )
@@ -31,6 +30,26 @@ BYPASS_MODE_LABELS = {
     "Remove CRC line (unsafe)": "remove",
     "Version placeholder": "placeholder",
 }
+DEFAULT_VIEWPORT_WIDTH = 1200
+DEFAULT_VIEWPORT_HEIGHT = 840
+SIDEBAR_WIDTH_MIN = 320
+SIDEBAR_WIDTH_RATIO = 0.32
+SIDEBAR_WIDTH_MAX = 520
+GUTTER_MIN = 48
+GUTTER_RATIO = 0.08
+GUTTER_MAX = 120
+DETAIL_WIDTH_MIN = 420
+WRAP_PADDING = 40
+WRAP_RATIO = 0.7
+CONSOLE_HEIGHT_MIN = 150
+CONSOLE_HEIGHT_RATIO = 0.22
+CONSOLE_HEIGHT_MAX = 240
+LAYOUT_PADDING = 110
+AVAILABLE_HEIGHT_MIN = 420
+CONTROL_REGION_MIN = 220
+CONTROL_REGION_RATIO = 0.44
+SIDEBAR_LIST_MIN = 240
+SIDEBAR_LIST_RATIO = 0.55
 
 
 @dataclass
@@ -146,7 +165,7 @@ def set_detail_header(block: QuestionBlock) -> None:
 def set_batch_header(count: int) -> None:
     dpg.set_value("question_name", "Batch Mode")
     dpg.set_value("question_token", "Multiple selections")
-    dpg.set_value("help_text", f"Modificando {count} elementos seleccionados")
+    dpg.set_value("help_text", f"Editing {count} selected questions.")
 
 
 def update_select_all_button_label(count: int) -> None:
@@ -461,56 +480,39 @@ def update_question_list(filter_text: str = "") -> None:
 
 
 def _get_viewport_dimensions() -> Tuple[int, int]:
-    viewport_width = 0
-    viewport_height = 0
-
     viewport_client_width = getattr(dpg, "get_viewport_client_width", None)
-    if viewport_client_width:
-        try:
-            viewport_width = viewport_client_width() or 0
-        except Exception:
-            viewport_width = 0
-
     viewport_client_height = getattr(dpg, "get_viewport_client_height", None)
-    if viewport_client_height:
-        try:
-            viewport_height = viewport_client_height() or 0
-        except Exception:
-            viewport_height = 0
+    viewport_width = viewport_client_width() if viewport_client_width else 0
+    viewport_height = viewport_client_height() if viewport_client_height else 0
 
     if not viewport_width:
-        try:
-            viewport_width = dpg.get_viewport_width() or 0
-        except Exception:
-            viewport_width = 0
+        viewport_width = dpg.get_viewport_width() if hasattr(dpg, "get_viewport_width") else 0
     if not viewport_height:
-        try:
-            viewport_height = dpg.get_viewport_height() or 0
-        except Exception:
-            viewport_height = 0
+        viewport_height = dpg.get_viewport_height() if hasattr(dpg, "get_viewport_height") else 0
 
     if not viewport_width:
-        viewport_width = 1200
+        viewport_width = DEFAULT_VIEWPORT_WIDTH
     if not viewport_height:
-        viewport_height = 840
+        viewport_height = DEFAULT_VIEWPORT_HEIGHT
 
-    return viewport_width, viewport_height
+    return int(viewport_width), int(viewport_height)
 
 
 def _calculate_layout_metrics() -> Dict[str, int]:
     viewport_width, viewport_height = _get_viewport_dimensions()
 
-    sidebar_width = int(max(320, min(viewport_width * 0.32, 520)))
-    gutter = int(max(48, min(viewport_width * 0.08, 120)))
-    detail_width = max(420, viewport_width - sidebar_width - gutter)
-    wrap_width = int(max(420, min(detail_width - 40, viewport_width * 0.7)))
+    sidebar_width = int(max(SIDEBAR_WIDTH_MIN, min(viewport_width * SIDEBAR_WIDTH_RATIO, SIDEBAR_WIDTH_MAX)))
+    gutter = int(max(GUTTER_MIN, min(viewport_width * GUTTER_RATIO, GUTTER_MAX)))
+    detail_width = max(DETAIL_WIDTH_MIN, viewport_width - sidebar_width - gutter)
+    wrap_width = int(max(DETAIL_WIDTH_MIN, min(detail_width - WRAP_PADDING, viewport_width * WRAP_RATIO)))
     wrap_width = min(wrap_width, int(detail_width))
 
-    console_panel_height = int(max(150, min(viewport_height * 0.22, 240)))
-    padding = 110
-    available_height = max(420, viewport_height - console_panel_height - padding)
-    control_region_height = max(220, int(available_height * 0.44))
-    sidebar_list_height = max(240, int(available_height * 0.55))
+    console_panel_height = int(
+        max(CONSOLE_HEIGHT_MIN, min(viewport_height * CONSOLE_HEIGHT_RATIO, CONSOLE_HEIGHT_MAX))
+    )
+    available_height = max(AVAILABLE_HEIGHT_MIN, viewport_height - console_panel_height - LAYOUT_PADDING)
+    control_region_height = max(CONTROL_REGION_MIN, int(available_height * CONTROL_REGION_RATIO))
+    sidebar_list_height = max(SIDEBAR_LIST_MIN, int(available_height * SIDEBAR_LIST_RATIO))
 
     return {
         "viewport_width": viewport_width,
@@ -600,7 +602,7 @@ def on_select_all_filtered(sender: int, app_data: object) -> None:
     update_question_list(filter_text)
     render_selection()
     update_batch_indicator()
-    append_log(f"MODO BATCH ACTIVO: Modificando {len(indices)} elementos")
+    append_log(f"Batch mode active: editing {len(indices)} questions.")
     append_log(f"Selected {len(indices)} questions matching the current filter.")
 
 
@@ -763,31 +765,10 @@ def on_batch_value_apply(sender: int, app_data: object, user_data: Optional[Dict
 
 
 def _range_error_message(min_value: Optional[int], max_value: Optional[int]) -> str:
-    return f"Valor fuera de rango (Min: {min_value}, Max: {max_value})"
-
-
-def get_risky_warning(block_name: str) -> Optional[str]:
-    lower_name = block_name.lower()
-    for keyword, warning in RISKY_CONFIGURATIONS.items():
-        if keyword in lower_name:
-            return warning
-    return None
+    return f"Value out of range (Min: {min_value}, Max: {max_value})"
 
 
 def handle_change_request(change: "PendingChange") -> None:
-    warnings: List[str] = []
-    for idx in change.block_indices:
-        block = state.blocks[idx]
-        warning = get_risky_warning(block.name)
-        if warning and warning.strip() not in warnings:
-            warnings.append(warning.strip())
-
-    if warnings:
-        state.pending_change = change
-        dpg.set_value("risk_warning_text", "\n".join(warnings))
-        dpg.configure_item("risk_modal", show=True)
-        return
-
     apply_pending_change(change)
 
 
@@ -856,24 +837,6 @@ def on_value_change(sender: int, app_data: object, user_data: Dict[str, object])
         conversion_note=conversion_note,
     )
     handle_change_request(pending)
-
-
-def on_risk_confirm(sender: int, app_data: object) -> None:
-    if state.pending_change is None:
-        dpg.configure_item("risk_modal", show=False)
-        return
-
-    dpg.configure_item("risk_modal", show=False)
-    apply_pending_change(state.pending_change)
-
-
-def on_risk_cancel(sender: int, app_data: object) -> None:
-    pending = state.pending_change
-    state.pending_change = None
-    dpg.configure_item("risk_modal", show=False)
-    if pending is not None:
-        render_selection()
-    append_log("Change cancelled due to risk warning.")
 
 
 def on_toggle_bypass_crc(sender: int, app_data: object) -> None:
@@ -1070,13 +1033,13 @@ def on_file_selected(file_path: Union[str, Path]) -> None:
     dpg.set_value("loaded_file_label", label_text)
     block_count = len(state.blocks)
     append_log(f"Successfully loaded {block_count} block(s).")
-    append_log(f"Escaneo finalizado: Se encontraron {block_count} bloques en total")
-    append_log(f"Carga completada. Total de bloques: {block_count}")
+    append_log(f"Scan complete: found {block_count} total blocks.")
+    append_log(f"Load complete. Total blocks: {block_count}")
     if block_count:
-        append_log(f"Archivo validado: {block_count} bloques de configuración encontrados")
+        append_log(f"Validated file: {block_count} configuration blocks found.")
         append_log(f"Loaded file: {resolved_path}")
     else:
-        append_log("ERROR: No se detectaron bloques Setup Question. Verifica el formato del archivo")
+        append_log("ERROR: No Setup Question blocks detected. Verify the file format.")
         append_log("CRITICAL: No Setup Question blocks detected. Confirm this is a valid AMISCE export.")
     update_question_list("")
     if state.blocks:
@@ -1299,14 +1262,6 @@ def build_ui() -> None:
                     height=-1,
                     width=-1,
                 )
-
-    with dpg.window(tag="risk_modal", modal=True, show=False, no_move=True, no_close=True, no_resize=True):
-        dpg.add_text("RISK WARNING")
-        dpg.add_separator()
-        dpg.add_text("", tag="risk_warning_text", wrap=420)
-        with dpg.group(horizontal=True):
-            dpg.add_button(label="Cancel", callback=on_risk_cancel)
-            dpg.add_button(label="Proceed", callback=on_risk_confirm)
 
     with dpg.window(tag="save_confirm_modal", modal=True, show=False, no_move=True, no_close=True, no_resize=True):
         dpg.add_text("Confirm Save")

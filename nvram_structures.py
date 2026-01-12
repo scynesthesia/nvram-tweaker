@@ -1,9 +1,7 @@
-"""Data structures used to model parsed NVRAM blocks and editable fields.
+"""Small data objects for parsed NVRAM blocks and fields.
 
-The structures in this module are intentionally lightweight and immutable to
-make it easy to reason about how a block is transformed during parsing and
-reconstruction. They expose explicit render helpers so formatting decisions are
-centralized instead of scattered across parsing and UI layers.
+They keep the parsed values plus formatting hints so the editor can render the
+file back without losing spacing or line endings.
 """
 from __future__ import annotations
 

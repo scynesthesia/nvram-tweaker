@@ -1,26 +1,8 @@
-"""Parsing helpers for AMI SCE NVRAM configuration blocks.
+"""Parse AMI SCE NVRAM exports into blocks and fields.
 
-Grammar summary
-================
-
-Blocks are grouped by leading lines that look like ``Setup Question = <name>``
-and continue until the next ``Setup Question`` or end-of-file. The parser is
-lenient about whitespace, optional comment prefixes (``#``, ``;``, ``//``), and
-mixed Windows/Unix line endings. Within a block:
-
-* ``Help String =`` lines capture free-form help text.
-* ``Token =`` lines identify firmware tokens. Comma-separated numeric values in
-  decimal or hexadecimal are accepted; inline ``//`` comments are stripped.
-* ``Value = <X>`` lines represent numeric entries.
-* Option entries follow ``[*][code]label`` where an optional ``Options =``
-  prefix may appear. The leading ``*`` marks the currently selected choice.
-
-Formatting assumptions
-----------------------
-
-The parser preserves surrounding separators, inline comments on ``Setup``
-lines, leading indentation, and per-line line endings. These details allow the
-reconstruction layer to round-trip text without mutation.
+The parser looks for ``Setup Question =`` headers, pulls out help strings,
+tokens, numeric values, and options, and keeps the surrounding formatting so
+the text can be rebuilt without losing layout details.
 """
 from __future__ import annotations
 

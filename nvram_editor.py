@@ -1,10 +1,8 @@
-"""Utility for updating AMI SCE NVRAM style BIOS configuration files.
+"""Tools for updating AMI SCE NVRAM text exports.
 
-The tool searches for blocks that begin with ``Setup Question =`` and allows
-modifying either options (moving the ``*`` to the requested option) or numeric
-values written as ``Value = <X>``. Searches can be done by exact or partial
-question names, optionally filtered by a token string, and changes can be
-applied to the first match or all matches.
+Finds ``Setup Question`` blocks and lets you move the selected option or update
+numeric ``Value = <X>`` entries. Searches can be exact or partial, filtered by
+token, and applied to one or many matching blocks.
 """
 from __future__ import annotations
 
@@ -37,11 +35,6 @@ from nvram_parsing import (
 from nvram_reconstruction import rebuild_text
 from nvram_structures import OptionField, QuestionBlock, ValueField
 
-RISKY_CONFIGURATIONS = {
-    "xhci hand-off": "WARNING: Changing this may disable USB peripherals. Do you want to continue? [yes/no]: ",
-    "aspm": "WARNING: Changing this may cause PCIe instability. Do you want to continue? [yes/no]: ",
-}
-
 LOGGER = logging.getLogger(__name__)
 
 MMAP_READ_THRESHOLD = 4 * 1024 * 1024
@@ -54,6 +47,29 @@ def _read_file_via_mmap(path: Path) -> bytes:
     with path.open("rb") as handle:
         with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mm_obj:
             return mm_obj.read()
+
+
+def _decode_bytes(raw_bytes: bytes, path: Path) -> tuple[str, str]:
+    try:
+        return raw_bytes.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError as exc:
+        try:
+            text = raw_bytes.decode("latin-1")
+        except UnicodeDecodeError:
+            preview = raw_bytes[: exc.start].decode("utf-8", errors="ignore")
+            line_number = preview.count("\n") + 1
+            raise ValueError(
+                f"Failed to decode '{path}' as UTF-8 or latin-1 near line {line_number}: {exc.reason}."
+            ) from exc
+
+        preview = raw_bytes[: exc.start].decode("utf-8", errors="ignore")
+        line_number = preview.count("\n") + 1
+        LOGGER.warning(
+            "Decoded '%s' with latin-1 after UTF-8 failure near line %d.",
+            path,
+            line_number,
+        )
+        return text, "latin-1"
 
 
 class NVRAMManager:
@@ -86,26 +102,7 @@ class NVRAMManager:
         except OSError as exc:
             raise ValueError(f"Unable to read '{path}': {exc}") from exc
 
-        decode_error: Optional[UnicodeDecodeError] = None
-        try:
-            text = raw_bytes.decode("utf-8")
-            self._encoding = "utf-8"
-        except UnicodeDecodeError as exc:
-            decode_error = exc
-            try:
-                text = raw_bytes.decode("latin-1")
-                self._encoding = "latin-1"
-            except UnicodeDecodeError:
-                preview = raw_bytes[: exc.start].decode("utf-8", errors="ignore")
-                line_number = preview.count("\n") + 1
-                raise ValueError(
-                    f"Failed to decode '{path}' as UTF-8 or latin-1 near line {line_number}: {exc.reason}."
-                ) from exc
-
-        if decode_error is not None:
-            preview = raw_bytes[: decode_error.start].decode("utf-8", errors="ignore")
-            line_number = preview.count("\n") + 1
-            print(f"Warning: decoded '{path}' with latin-1 after UTF-8 failure near line {line_number}.")
+        text, self._encoding = _decode_bytes(raw_bytes, path)
 
         try:
             self.blocks, self.trailing_text = find_blocks(text)
@@ -443,24 +440,14 @@ def _validate_value_arg(raw_value: str) -> tuple[int, Optional[str]]:
         raise ValueError(str(exc))
 
 
-def confirm_risky_query(query: str) -> None:
-    query_lower = query.lower()
-    for keyword, warning in RISKY_CONFIGURATIONS.items():
-        if keyword in query_lower:
-            response = input(warning).strip().lower()
-            if response not in {"yes", "y"}:
-                raise ValueError("Operation cancelled by user due to risk warning.")
-            break
-
-
 def main() -> int:
     args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     try:
         manager = NVRAMManager().load_file(args.file)
         blocks = manager.blocks
 
-        confirm_risky_query(args.query)
         candidates = manager.filter_blocks(args.query, args.exact, args.token)
 
         if not candidates:
@@ -468,11 +455,11 @@ def main() -> int:
 
         target_indices = [blocks.index(b) for b in candidates]
         if len(target_indices) > 1 and not args.all and args.token is None:
-            print("Multiple matching blocks found:")
+            LOGGER.info("Multiple matching blocks found:")
             for display_index, block_index in enumerate(target_indices, start=1):
                 description = describe_block(blocks[block_index])
                 formatted_description = "\n   ".join(description.splitlines())
-                print(f"{display_index}. {formatted_description}")
+                LOGGER.info("%s. %s", display_index, formatted_description)
             while True:
                 selection = input(
                     'Select the indices to modify (comma-separated, e.g., "1,3,5") or "A" for all: '
@@ -493,7 +480,7 @@ def main() -> int:
                             unique_indices.append(block_idx)
                     target_indices = unique_indices
                     break
-                print("Invalid selection. Please try again.")
+                LOGGER.info("Invalid selection. Please try again.")
         elif not args.all:
             target_indices = target_indices[:1]
 
@@ -517,12 +504,12 @@ def main() -> int:
             raise ValueError(f"Could not update the requested block(s): {exc}") from exc
         after_descriptions = {idx: describe_block(updated_blocks[idx]) for idx in target_indices}
 
-        print("Summary of changes (Before -> After):")
+        LOGGER.info("Summary of changes (Before -> After):")
         if value_conversion_note:
-            print(f"  {value_conversion_note}")
+            LOGGER.info("  %s", value_conversion_note)
         for idx in target_indices:
-            print(f"- {before_descriptions[idx]}")
-            print(f"  -> {after_descriptions[idx]}")
+            LOGGER.info("- %s", before_descriptions[idx])
+            LOGGER.info("  -> %s", after_descriptions[idx])
 
         confirmation = input("Apply these changes? (Y/N): ").strip().lower()
         if confirmation not in {"y", "yes"}:
@@ -531,13 +518,13 @@ def main() -> int:
         manager.blocks = updated_blocks
         new_text = manager.rebuild_text(updated_blocks)
         if args.dry_run:
-            print("[DRY RUN] No changes were written to disk.")
+            LOGGER.info("[DRY RUN] No changes were written to disk.")
             return 0
 
         manager.save(args.file, new_text)
         return 0
     except ValueError as exc:
-        print(exc)
+        LOGGER.error("%s", exc)
         return 1
 
 
