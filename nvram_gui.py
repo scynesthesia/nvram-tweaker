@@ -35,6 +35,7 @@ def resource_path(relative_path: str) -> str:
 
 
 INLINE_COMMENT_PATTERN = re.compile(r"\s//")
+INT32_MAX = 2**31 - 1
 DEFAULT_VIEWPORT_WIDTH = 1200
 DEFAULT_VIEWPORT_HEIGHT = 840
 SIDEBAR_WIDTH_MIN = 320
@@ -94,6 +95,7 @@ class GUIState:
     scewin_runner: Optional[SCEWINRunner] = None
     pending_scewin_action: Optional[str] = None
     pending_scewin_path: Optional[Path] = None
+    closing: bool = False
 
 
 state = GUIState()
@@ -281,7 +283,10 @@ def rebuild_controls(block_index: int, block: QuestionBlock) -> None:
     value_match = VALUE_PATTERN.search(block.body)
     if value_match:
         current_value_text = value_match.group("value")
-        use_numeric_input = current_value_text.isdigit()
+        low, high = block.value_bounds()
+        # Dear PyGui's integer widget is 32-bit signed; wider settings use the text field.
+        fits_int32 = (high is None or high <= INT32_MAX) and (low is None or low >= 0)
+        use_numeric_input = current_value_text.isdigit() and fits_int32
 
         with dpg.group(parent="control_region", horizontal=True):
             if use_numeric_input:
@@ -289,7 +294,10 @@ def rebuild_controls(block_index: int, block: QuestionBlock) -> None:
                 dpg.add_input_int(
                     tag=input_tag,
                     label="Value",
-                    min_value=0,
+                    min_value=low if low is not None else 0,
+                    max_value=high if high is not None else INT32_MAX,
+                    min_clamped=True,
+                    max_clamped=True,
                     default_value=int(current_value_text),
                     width=180,
                 )
@@ -309,6 +317,9 @@ def rebuild_controls(block_index: int, block: QuestionBlock) -> None:
                 callback=on_value_change,
                 user_data={"block_index": block_index, "input_tag": input_tag},
             )
+        if low is not None or high is not None:
+            size = f" ({block.width}-byte setting)" if block.width else ""
+            dpg.add_text(f"Allowed range: {low} to {high}{size}.", parent="control_region", tag="value_range_hint")
         dpg.add_text(
             "Enter decimal values or 0x-prefixed hexadecimal when using the text field.",
             parent="control_region",
@@ -901,6 +912,45 @@ def perform_save(sender: int, app_data: object) -> None:
     _hide_save_confirm_modal(sender, app_data)
 
 
+def _quit() -> None:
+    # The exit callback also fires on the last frame; the flag keeps it from re-prompting.
+    state.closing = True
+    dpg.stop_dearpygui()
+
+
+def on_close_requested() -> None:
+    """Called when the window's close button is pressed (the viewport is created with disable_close)."""
+
+    if state.closing:
+        return
+    if not state.modified_indices:
+        _quit()
+        return
+    dpg.set_value(
+        "close_confirm_text",
+        f"You have {len(state.modified_indices)} unsaved change(s). Closing now discards them.",
+    )
+    dpg.configure_item("close_confirm_modal", show=True)
+
+
+def on_close_cancel(sender: int, app_data: object) -> None:
+    dpg.configure_item("close_confirm_modal", show=False)
+
+
+def on_close_discard(sender: int, app_data: object) -> None:
+    dpg.configure_item("close_confirm_modal", show=False)
+    _quit()
+
+
+def on_close_save(sender: int, app_data: object) -> None:
+    dpg.configure_item("close_confirm_modal", show=False)
+    perform_save(sender, app_data)
+    if state.modified_indices:  # the save failed; perform_save logged why
+        append_log("Not closing: the changes could not be saved.")
+        return
+    _quit()
+
+
 def on_file_selected(file_path: Union[str, Path]) -> None:
     resolved_path = Path(file_path).expanduser().resolve()
     if not resolved_path.exists():
@@ -959,6 +1009,12 @@ def _dialog_start_path() -> str:
 
 
 def open_file_dialog() -> None:
+    if state.modified_indices:
+        show_message(
+            "Unsaved changes",
+            "Opening another file would discard your unsaved changes. Save them first.",
+        )
+        return
     root = Tk()
     root.withdraw()
     try:
@@ -1369,7 +1425,17 @@ def build_ui() -> None:
         dpg.add_text("", tag="message_text", wrap=560)
         dpg.add_button(label="Close", callback=lambda sender, app_data: dpg.configure_item("message_modal", show=False))
 
-    dpg.create_viewport(title="NVRAM Tweaker UI", width=1200, height=840, resizable=True)
+    with dpg.window(tag="close_confirm_modal", modal=True, show=False, no_move=True, no_close=True, no_resize=True):
+        dpg.add_text("Unsaved changes", color=(255, 170, 120))
+        dpg.add_separator()
+        dpg.add_text("", tag="close_confirm_text", wrap=420)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Cancel", callback=on_close_cancel)
+            dpg.add_button(label="Discard and close", callback=on_close_discard)
+            dpg.add_button(label="Save and close", callback=on_close_save)
+
+    dpg.create_viewport(title="NVRAM Tweaker UI", width=1200, height=840, resizable=True, disable_close=True)
+    dpg.set_exit_callback(on_close_requested)
     dpg.setup_dearpygui()
     dpg.show_viewport()
     update_detail_wraps()
