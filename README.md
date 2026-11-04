@@ -4,7 +4,24 @@ NVRAM Tweaker is a Python utility for exploring and updating AMISCE-style BIOS *
 
 ## Downloads
 
-- Download the prebuilt Windows executable from Releases (**NVRAM_Tweaker_v1**) for the recommended GUI workflow.
+- Download `NVRAM_Tweaker.exe` from [Releases](https://github.com/scynesthesia/nvram-tweaker/releases). Each release is built from its tagged commit by the [build workflow](.github/workflows/build.yml) and comes with `SHA256SUMS.txt`. Verify your download in PowerShell before running it:
+
+  ```powershell
+  (Get-FileHash .\NVRAM_Tweaker.exe -Algorithm SHA256).Hash.ToLower()   # must match SHA256SUMS.txt
+  ```
+
+## Building the executable yourself
+
+The exact steps CI uses ([`.github/workflows/build.yml`](.github/workflows/build.yml)), on Windows with Python 3.12:
+
+```bash
+python -m pip install -r requirements-build.txt   # pinned dearpygui / pyinstaller / pytest
+python -m pytest -q
+python scripts/fetch_fonts.py                     # downloads DejaVu fonts, verified by SHA-256
+python -m PyInstaller --clean --noconfirm nvram_tweaker.spec
+```
+
+The result is `dist/NVRAM_Tweaker.exe`. To publish a release, push a tag such as `v1.1.0`; the workflow tests, builds and attaches the exe and its checksum.
 
 ## Requirements (source builds)
 
