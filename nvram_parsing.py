@@ -71,6 +71,23 @@ def parse_number(raw: str) -> int:
     return int(cleaned, 10)
 
 
+def normalize_token(raw: str) -> str:
+    """Canonical form of a token so ``7D1``, ``0x7d1`` and ``007D1`` compare equal.
+
+    Tokens are hexadecimal as printed in the export (``Token =7D1``); a token may
+    also be a comma-separated list. Raises ``ValueError`` if it is not hex.
+    """
+
+    parts = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            parts.append(f"{int(part, 16):X}")
+    if not parts:
+        raise ValueError("empty token")
+    return ",".join(parts)
+
+
 def find_blocks(text: str) -> tuple[List[QuestionBlock], str]:
     """Parse all blocks from raw text, preserving formatting metadata.
 

@@ -103,6 +103,13 @@ def find_risky_blocks(blocks: Iterable[QuestionBlock]) -> List[Tuple[QuestionBlo
     return risky
 
 
+def option_text(field: OptionField) -> str:
+    """An option as ``[01]Enabled``, without SCEWIN's trailing '// Move "*" ...' hint."""
+
+    label = _INLINE_COMMENT.split(field.label, maxsplit=1)[0].strip() or field.label.strip()
+    return f"[{field.code}]{label}"
+
+
 def current_setting(block: QuestionBlock) -> Optional[str]:
     """Describe a block's current value, e.g. ``Value <3>`` or ``[01]Enabled``."""
 
@@ -111,8 +118,7 @@ def current_setting(block: QuestionBlock) -> Optional[str]:
             return f"Value <{field.value}>"
     for field in block.fields:
         if isinstance(field, OptionField) and field.selected:
-            label = _INLINE_COMMENT.split(field.label, maxsplit=1)[0].strip() or field.label.strip()
-            return f"[{field.code}]{label}"
+            return option_text(field)
     return None
 
 
@@ -254,6 +260,7 @@ __all__ = [
     "find_risky_blocks",
     "missing_questions",
     "noted_keywords",
+    "option_text",
     "preflight_issues",
     "risky_keywords",
 ]

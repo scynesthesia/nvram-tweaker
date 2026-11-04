@@ -9,15 +9,10 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 import dearpygui.dearpygui as dpg
 from tkinter import Tk, filedialog
 
-from nvram_editor import (
-    NVRAMManager,
-    QuestionBlock,
-    OPTION_LINE_PATTERN,
-    VALUE_PATTERN,
-    validate_numeric_input,
-    apply_changes,
-)
+from nvram_editor import NVRAMManager, apply_changes
+from nvram_parsing import OPTION_LINE_PATTERN, VALUE_PATTERN, validate_numeric_input
 from nvram_safety import current_setting, find_risky_blocks
+from nvram_structures import QuestionBlock
 from scewin_runner import (
     DEFAULT_SCRIPT_NAME,
     SCEWINError,

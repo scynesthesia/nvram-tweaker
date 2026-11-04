@@ -32,7 +32,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence
 
+from nvram_cli_prompts import confirm_write
 from nvram_crc import crc_header_mismatch
+from nvram_editor import restore_point_path
 from nvram_safety import SettingChange, diff_texts, missing_questions, preflight_issues
 from scewin_diagnostics import REFERENCE_URL, Diagnosis, diagnose, has_errors
 
@@ -124,10 +126,6 @@ def guess_scewin_dir(candidates: Iterable[Path]) -> Optional[Path]:
 def default_scewin_candidates() -> List[Path]:
     app_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
     return [Path.cwd(), app_dir]
-
-
-def restore_point_path(script_path: Path) -> Path:
-    return script_path.with_name(f"{script_path.stem}.original{script_path.suffix}")
 
 
 class SCEWINRunner:
@@ -255,53 +253,55 @@ def _read_text(path: Path) -> str:
     return text.replace("\r\n", "\n")
 
 
-def _confirm(prompt: str, expected: Sequence[str]) -> bool:
-    return input(prompt).strip().lower() in expected
-
-
-def _print_changes(changes: Optional[List[SettingChange]]) -> bool:
-    """Print the diff against the restore point; return True if any change is risky."""
+def _print_changes(changes: Optional[List[SettingChange]]) -> List[str]:
+    """Print the diff against the restore point; return the confirm-level changes."""
 
     if changes is None:
         print("No restore point found, so the changes cannot be listed. Export first to create one.")
-        return False
+        return []
     if not changes:
         print("No settings differ from the restore point.")
-        return False
+        return []
     print(f"{len(changes)} setting(s) differ from the restore point:")
     for change in changes:
         print(f"  - {change.format()}")
-    return any(change.risk_keywords for change in changes)
+    return [change.format() for change in changes if change.risk_keywords]
 
 
-def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export, import or restore NVRAM settings with SCEWIN.")
-    sub = parser.add_subparsers(dest="command", required=True)
+def add_subcommands(sub: "argparse._SubParsersAction") -> None:
+    """Register export / import / restore / diagnose on an argparse sub-parser group."""
 
     def add_common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--scewin", type=Path, help="Folder with SCEWIN_64.exe and its drivers")
         p.add_argument("--file", type=Path, default=Path(DEFAULT_SCRIPT_NAME), help="NVRAM script path")
 
-    add_common(sub.add_parser("export", help="Export current NVRAM settings to the script file"))
-    import_parser = sub.add_parser("import", help="Write the script file to NVRAM")
+    add_common(sub.add_parser("export", help="Export the current BIOS settings with SCEWIN"))
+    import_parser = sub.add_parser("import", help="Write the script file to the BIOS with SCEWIN")
     add_common(import_parser)
-    import_parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompts")
-    restore_parser = sub.add_parser("restore", help="Re-import the restore point saved by the first export")
+    import_parser.add_argument("--yes", action="store_true", help="Skip the Y/N question (scripts)")
+    import_parser.add_argument(
+        "--allow-risky", action="store_true", help="Confirm changes to risky settings without asking (scripts)"
+    )
+    restore_parser = sub.add_parser("restore", help="Re-import the untouched copy saved by the first export")
     add_common(restore_parser)
-    restore_parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+    restore_parser.add_argument("--yes", action="store_true", help="Skip the Y/N question (scripts)")
     diagnose_parser = sub.add_parser("diagnose", help="Explain an existing SCEWIN log file")
     diagnose_parser.add_argument("log", type=Path, help="Path to log-file.txt")
-    return parser.parse_args(argv)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = _parse_args(argv)
+def run(
+    args: argparse.Namespace,
+    *,
+    interactive: Optional[bool] = None,
+    ask: Callable[[str], str] = input,
+) -> int:
+    """Run one of the commands registered by :func:`add_subcommands`."""
 
     if args.command == "diagnose":
         try:
             diagnoses = diagnose(_read_text(args.log))
         except OSError as exc:
-            print(f"error: {exc}")
+            print(f"error: {exc}", file=sys.stderr)
             return 1
         if not diagnoses:
             print("No known SCEWIN messages found in this log.")
@@ -323,31 +323,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             issues = runner.check_import(args.file)
             if issues:
                 raise SCEWINError("Import blocked by preflight checks:\n- " + "\n- ".join(issues))
-            risky = _print_changes(runner.changes_since_export(args.file))
-            if not args.yes:
-                if risky and not _confirm(
-                    "Some changes touch risky settings (marked RISK). Type YES to continue: ", ("yes",)
-                ):
-                    print("Import cancelled.")
-                    return 1
-                if not _confirm("Write these settings to NVRAM now? (Y/N): ", ("y", "yes")):
-                    print("Import cancelled.")
-                    return 1
+            risky_lines = _print_changes(runner.changes_since_export(args.file))
+            if not confirm_write(
+                "Write these settings to the BIOS now?",
+                risky_lines=risky_lines,
+                yes=args.yes,
+                allow_risky=args.allow_risky,
+                interactive=interactive,
+                ask=ask,
+            ):
+                return 1
             result = runner.import_script(args.file)
         else:
-            if not args.yes and not _confirm(
-                "Re-import the original export and undo all changes? (Y/N): ", ("y", "yes")
+            if not confirm_write(
+                "Re-import the original export and undo all changes?",
+                yes=args.yes,
+                interactive=interactive,
+                ask=ask,
             ):
-                print("Restore cancelled.")
                 return 1
             result = runner.restore(args.file)
     except SCEWINError as exc:
-        print(f"error: {exc}")
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
     for line in result.summary_lines():
         print(line)
     return 0 if result.ok else 1
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Stand-alone entry point; ``nvram_tweaker_cli.py`` offers the same commands plus list/show/set."""
+
+    parser = argparse.ArgumentParser(description="Export, import or restore BIOS settings with SCEWIN.")
+    add_subcommands(parser.add_subparsers(dest="command", required=True))
+    return run(parser.parse_args(argv))
 
 
 if __name__ == "__main__":

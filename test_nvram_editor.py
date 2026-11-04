@@ -159,7 +159,7 @@ def test_apply_changes_rejects_out_of_range_value(tmp_path: Path) -> None:
     ],
 )
 def test_validate_numeric_input_accepts_valid_values(raw: str, expected: int, conversion_note: str) -> None:
-    parsed, note = nvram_editor.validate_numeric_input(raw)
+    parsed, note = nvram_parsing.validate_numeric_input(raw)
     assert parsed == expected
     assert note == conversion_note
 
@@ -170,4 +170,4 @@ def test_validate_numeric_input_accepts_valid_values(raw: str, expected: int, co
 )
 def test_validate_numeric_input_rejects_invalid_values(raw: str) -> None:
     with pytest.raises(ValueError):
-        nvram_editor.validate_numeric_input(raw)
+        nvram_parsing.validate_numeric_input(raw)

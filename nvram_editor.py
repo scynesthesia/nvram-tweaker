@@ -13,7 +13,7 @@ import re
 import shutil
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 
 from nvram_crc import extract_crc_header, preserve_crc_header
 from nvram_parsing import (
@@ -21,11 +21,10 @@ from nvram_parsing import (
     VALUE_PATTERN,
     find_blocks,
     matches_name,
+    normalize_token,
     selected_option,
-    validate_numeric_input,
 )
 from nvram_reconstruction import rebuild_text
-from nvram_safety import find_risky_blocks
 from nvram_structures import OptionField, QuestionBlock, ValueField
 
 LOGGER = logging.getLogger(__name__)
@@ -39,12 +38,16 @@ def _decode_bytes(raw_bytes: bytes, path: Path) -> tuple[str, str]:
     except UnicodeDecodeError as exc:
         preview = raw_bytes[: exc.start].decode("utf-8", errors="ignore")
         line_number = preview.count("\n") + 1
-        LOGGER.warning(
-            "Decoded '%s' with latin-1 after UTF-8 failure near line %d.",
-            path,
-            line_number,
-        )
+        # Expected, not a problem: SCEWIN writes in a Windows code page (e.g. "85\xb0C" options).
+        # latin-1 maps every byte to a character, so reading and saving is lossless.
+        LOGGER.info("Read '%s' as latin-1 (non-UTF-8 byte near line %d).", path, line_number)
         return raw_bytes.decode("latin-1"), "latin-1"
+
+
+def restore_point_path(script_path: Path) -> Path:
+    """Where the untouched copy of an export lives: ``nvram.txt`` -> ``nvram.original.txt``."""
+
+    return script_path.with_name(f"{script_path.stem}.original{script_path.suffix}")
 
 
 def _write_atomically(path: Path, data: bytes) -> None:
@@ -182,11 +185,33 @@ class NVRAMManager:
 
         return block.with_body("".join(new_lines)).with_fields(new_fields)
 
-    def filter_blocks(self, query: str, exact: bool, token: Optional[str]) -> List[QuestionBlock]:
-        filtered = [b for b in self.blocks if not b.is_commented and matches_name(b, query, exact)]
+    def matching_indices(self, query: str, exact: bool, token: Optional[str]) -> List[int]:
+        """Positions of the active (not commented-out) questions that match.
+
+        ``token`` is compared as a hexadecimal number, so ``7D1``, ``0x7d1`` and
+        ``007D1`` all select the same question.
+        """
+
+        wanted: Optional[str] = None
         if token is not None:
-            filtered = [b for b in filtered if b.token == token]
-        return filtered
+            try:
+                wanted = normalize_token(token)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid token '{token}': tokens are hexadecimal as printed in the export, e.g. 7D1 or 0x7D1."
+                ) from None
+
+        indices = []
+        for index, block in enumerate(self.blocks):
+            if block.is_commented or not matches_name(block, query, exact):
+                continue
+            if wanted is not None and (block.token is None or normalize_token(block.token) != wanted):
+                continue
+            indices.append(index)
+        return indices
+
+    def filter_blocks(self, query: str, exact: bool, token: Optional[str]) -> List[QuestionBlock]:
+        return [self.blocks[i] for i in self.matching_indices(query, exact, token)]
 
     def save(self, path: Path, new_content: str) -> None:
         """Write ``new_content`` to ``path`` after backing up the current file.
@@ -211,6 +236,11 @@ class NVRAMManager:
                 "overwriting external edits."
             )
 
+        # The first save also keeps the untouched file, so the original survives any number
+        # of later saves (the .bak only ever holds the previous version).
+        restore_point = restore_point_path(path)
+        if not path.stem.endswith(".original") and not restore_point.exists():
+            shutil.copyfile(path, restore_point)
         # A byte-for-byte copy: re-encoding or newline translation would alter the backup.
         shutil.copyfile(path, path.with_name(path.name + ".bak"))
 
@@ -348,131 +378,42 @@ def apply_changes(
     return updated_blocks
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Update AMI SCE NVRAM configuration blocks.")
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Arguments of the original ``nvram_editor.py`` command (kept for existing scripts)."""
+
+    parser = argparse.ArgumentParser(
+        description="Update AMI SCE NVRAM configuration blocks. "
+        "Prefer nvram_tweaker_cli.py (list / show / set / export / import / restore)."
+    )
     parser.add_argument("file", type=Path, help="Path to the NVRAM configuration file")
     parser.add_argument("query", help="Question name to search (exact or partial)")
     parser.add_argument("value", help="New option label substring or numeric value, depending on the block type")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Perform all steps without writing any changes to disk",
-    )
-    parser.add_argument(
-        "--token",
-        help="Token identifier to disambiguate repeated questions",
-    )
-    parser.add_argument(
-        "--exact",
-        action="store_true",
-        help="Require an exact question name match instead of partial",
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Apply the change to all matching blocks; otherwise only the first is changed",
-    )
+    parser.add_argument("--dry-run", action="store_true", help="Show the changes without writing anything")
+    parser.add_argument("--token", help="Token (hexadecimal) to disambiguate repeated questions")
+    parser.add_argument("--exact", action="store_true", help="Require an exact question name match")
+    parser.add_argument("--all", action="store_true", help="Apply the change to every matching question")
     parser.add_argument(
         "--mode",
         choices=["option", "value"],
         required=True,
-        help="Specify whether the target uses option lines (move *) or a numeric Value",
+        help="Whether the target uses option lines (move *) or a numeric Value",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Old entry point: forwards to ``nvram_tweaker_cli.py set``."""
 
-    try:
-        manager = NVRAMManager().load_file(args.file)
-        blocks = manager.blocks
+    args = parse_args(argv)
+    from nvram_tweaker_cli import main as cli_main
 
-        candidates = manager.filter_blocks(args.query, args.exact, args.token)
-
-        if not candidates:
-            raise ValueError("No matching Setup Question blocks found")
-
-        target_indices = [blocks.index(b) for b in candidates]
-        if len(target_indices) > 1 and not args.all and args.token is None:
-            LOGGER.info("Multiple matching blocks found:")
-            for display_index, block_index in enumerate(target_indices, start=1):
-                description = describe_block(blocks[block_index])
-                formatted_description = "\n   ".join(description.splitlines())
-                LOGGER.info("%s. %s", display_index, formatted_description)
-            while True:
-                selection = input(
-                    'Select the indices to modify (comma-separated, e.g., "1,3,5") or "A" for all: '
-                ).strip()
-                if selection.lower() == "a":
-                    break
-
-                try:
-                    chosen_numbers = [int(part.strip()) for part in selection.split(",") if part.strip()]
-                except ValueError:
-                    chosen_numbers = []
-
-                if chosen_numbers and all(1 <= num <= len(target_indices) for num in chosen_numbers):
-                    unique_indices = []
-                    for num in chosen_numbers:
-                        block_idx = target_indices[num - 1]
-                        if block_idx not in unique_indices:
-                            unique_indices.append(block_idx)
-                    target_indices = unique_indices
-                    break
-                LOGGER.info("Invalid selection. Please try again.")
-        elif not args.all:
-            target_indices = target_indices[:1]
-
-        option_label: Optional[str] = args.value if args.mode == "option" else None
-        new_value: Optional[int]
-        value_conversion_note: Optional[str] = None
-
-        if args.mode == "value":
-            new_value, value_conversion_note = validate_numeric_input(args.value.strip())
-        else:
-            new_value = None
-
-        before_descriptions = {idx: describe_block(blocks[idx]) for idx in target_indices}
-        try:
-            updated_blocks = apply_changes(manager, blocks, target_indices, option_label, new_value)
-        except ValueError as exc:
-            raise ValueError(f"Could not update the requested block(s): {exc}") from exc
-        after_descriptions = {idx: describe_block(updated_blocks[idx]) for idx in target_indices}
-
-        LOGGER.info("Summary of changes (Before -> After):")
-        if value_conversion_note:
-            LOGGER.info("  %s", value_conversion_note)
-        for idx in target_indices:
-            LOGGER.info("- %s", before_descriptions[idx])
-            LOGGER.info("  -> %s", after_descriptions[idx])
-
-        risky = find_risky_blocks(blocks[idx] for idx in target_indices)
-        if risky:
-            LOGGER.warning("WARNING: these questions touch settings that can leave the machine unbootable")
-            LOGGER.warning("or without input/display if set wrong:")
-            for block, keywords in risky:
-                LOGGER.warning("  - %s [%s]", block.name, ", ".join(keywords))
-            risk_confirmation = input("Type YES to confirm you want to change risky settings: ").strip()
-            if risk_confirmation.lower() != "yes":
-                raise ValueError("No changes applied; risky change not confirmed.")
-
-        confirmation = input("Apply these changes? (Y/N): ").strip().lower()
-        if confirmation not in {"y", "yes"}:
-            raise ValueError("No changes applied; user cancelled at confirmation step.")
-
-        manager.blocks = updated_blocks
-        new_text = manager.rebuild_text(updated_blocks)
-        if args.dry_run:
-            LOGGER.info("[DRY RUN] No changes were written to disk.")
-            return 0
-
-        manager.save(args.file, new_text)
-        return 0
-    except ValueError as exc:
-        LOGGER.error("%s", exc)
-        return 1
+    forwarded = ["set", str(args.file), args.query, args.value, "--mode", args.mode]
+    for flag, enabled in (("--dry-run", args.dry_run), ("--exact", args.exact), ("--all", args.all)):
+        if enabled:
+            forwarded.append(flag)
+    if args.token is not None:
+        forwarded += ["--token", args.token]
+    return cli_main(forwarded)
 
 
 if __name__ == "__main__":
