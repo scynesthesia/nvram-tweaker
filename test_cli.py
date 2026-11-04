@@ -341,3 +341,14 @@ def test_import_without_a_scewin_folder_is_a_clear_error(tmp_path, capsys, monke
     monkeypatch.setattr(scewin_runner, "default_scewin_candidates", lambda: [tmp_path])
     code, _, err = run_cli(capsys, "export", "--file", tmp_path / "nvram.txt")
     assert code == 1 and "Could not find a SCEWIN folder" in err
+
+
+def test_a_filesystem_error_is_reported_not_raised(export, capsys, monkeypatch) -> None:
+    def deny(*args, **kwargs):
+        raise PermissionError("access is denied")
+
+    monkeypatch.setattr(nvram_editor, "_write_atomically", deny)
+    before = export.read_bytes()
+    code, _, err = run_cli(capsys, "set", export, "Adjust VID", "300", "--yes")
+    assert code == 1 and "access is denied" in err
+    assert export.read_bytes() == before

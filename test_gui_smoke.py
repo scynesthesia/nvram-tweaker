@@ -259,3 +259,9 @@ def test_export_edit_import_restore_flow(gui, tmp_path, monkeypatch) -> None:
     gui.on_scewin_confirm(None, None)
     assert run.calls[-1][1:] == ["/i", "/s", str((tmp_path / "nvram.original.txt").resolve())]
     assert any("SCEWIN restore succeeded" in m for m in gui.state.log_messages)
+
+
+def test_window_title_shows_the_version(gui) -> None:
+    from nvram_version import __version__
+
+    assert dpg.get_item_label("primary_window") == f"NVRAM Tweaker {__version__}"

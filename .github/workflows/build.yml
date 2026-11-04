@@ -1,9 +1,14 @@
 name: Test and build
 
-# Every push and pull request runs the tests and builds NVRAM_Tweaker.exe from
-# this exact commit. Pushing a tag such as v1.1.0 also publishes a GitHub
-# release with the exe and its SHA-256 checksum, so anyone can verify that a
-# downloaded exe came from this workflow.
+# Every push and pull request runs the tests on Windows and Linux (Python 3.10 and
+# 3.12) and builds NVRAM_Tweaker.exe from this exact commit. Pushing a tag such as
+# v2.0.0 also publishes a GitHub release with the exe and its SHA-256 checksum, so
+# anyone can verify that a downloaded exe came from this workflow. The tag must
+# match nvram_version.py or the build fails.
+#
+# Dependencies come from requirements-build.txt only (exact versions, SHA-256
+# hashes, installed with --require-hashes). Regenerate it from
+# requirements-build.in when you want to upgrade something.
 on:
   push:
     branches: [main]
@@ -16,10 +21,12 @@ permissions:
 
 jobs:
   test:
+    name: test (${{ matrix.os }}, python ${{ matrix.python }})
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest]
+        python: ["3.10", "3.12"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -27,9 +34,17 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.12"
-      - run: python -m pip install -r requirements-build.txt
-      - run: python -m pytest -q
+          python-version: ${{ matrix.python }}
+      - name: Install libraries the GUI tests need (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb libgl1 libx11-6 libxrandr2 libxinerama1 libxcursor1 libxi6
+      - run: python -m pip install --require-hashes -r requirements-build.txt
+      - name: Tests (Windows)
+        if: runner.os == 'Windows'
+        run: python -m pytest -q
+      - name: Tests (Linux, virtual display)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m pytest -q
 
   build:
     needs: test
@@ -41,7 +56,15 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      - run: python -m pip install -r requirements-build.txt
+      - name: Tag must match the version in nvram_version.py
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = (python -c "from nvram_version import __version__; print(__version__)").Trim()
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "Tag $env:GITHUB_REF_NAME does not match nvram_version.py ($version). Bump the version, commit, and tag again."
+          }
+      - run: python -m pip install --require-hashes -r requirements-build.txt
       - run: python scripts/fetch_fonts.py
       - run: python -m PyInstaller --clean --noconfirm nvram_tweaker.spec
       - name: Write checksum

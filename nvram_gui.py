@@ -13,6 +13,7 @@ from nvram_editor import NVRAMManager, apply_changes
 from nvram_parsing import OPTION_LINE_PATTERN, VALUE_PATTERN, validate_numeric_input
 from nvram_safety import current_setting, find_risky_blocks
 from nvram_structures import QuestionBlock
+from nvram_version import __version__
 from scewin_runner import (
     DEFAULT_SCRIPT_NAME,
     SCEWINError,
@@ -1281,7 +1282,7 @@ def build_ui() -> None:
     apply_dark_theme()
     layout = _calculate_layout_metrics()
 
-    with dpg.window(tag="primary_window", label="NVRAM Tweaker - Dear PyGui", width=1200, height=820):
+    with dpg.window(tag="primary_window", label=f"NVRAM Tweaker {__version__}", width=1200, height=820):
         dpg.add_spacer(height=8)
 
         with dpg.group(horizontal=True, horizontal_spacing=8):
@@ -1429,7 +1430,7 @@ def build_ui() -> None:
             dpg.add_button(label="Discard and close", callback=on_close_discard)
             dpg.add_button(label="Save and close", callback=on_close_save)
 
-    dpg.create_viewport(title="NVRAM Tweaker UI", width=1200, height=840, resizable=True, disable_close=True)
+    dpg.create_viewport(title=f"NVRAM Tweaker {__version__}", width=1200, height=840, resizable=True, disable_close=True)
     dpg.set_exit_callback(on_close_requested)
     dpg.setup_dearpygui()
     dpg.show_viewport()

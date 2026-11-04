@@ -332,7 +332,7 @@ def main(
         if args.command == "set":
             return cmd_set(args, interactive=interactive, ask=ask)
         return scewin_runner.run(args, interactive=interactive, ask=ask)
-    except (ValueError, scewin_runner.SCEWINError) as exc:
+    except (ValueError, OSError, scewin_runner.SCEWINError) as exc:
         _error(str(exc))
         return EXIT_ERROR
 
