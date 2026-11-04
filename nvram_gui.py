@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -13,9 +13,20 @@ from nvram_editor import (
     NVRAMManager,
     QuestionBlock,
     OPTION_LINE_PATTERN,
+    UNSAFE_CRC_BYPASS_MODES,
     VALUE_PATTERN,
     validate_numeric_input,
     apply_changes,
+)
+from nvram_safety import find_risky_blocks
+from scewin_runner import (
+    DEFAULT_SCRIPT_NAME,
+    SCEWINError,
+    SCEWINResult,
+    SCEWINRunner,
+    default_scewin_candidates,
+    guess_scewin_dir,
+    restore_point_path,
 )
 
 
@@ -28,7 +39,7 @@ INLINE_COMMENT_PATTERN = re.compile(r"\s//")
 BYPASS_MODE_LABELS = {
     "Empty CRC value (unsafe)": "empty",
     "Remove CRC line (unsafe)": "remove",
-    "Version placeholder": "placeholder",
+    "Version placeholder (unsafe)": "placeholder",
 }
 DEFAULT_VIEWPORT_WIDTH = 1200
 DEFAULT_VIEWPORT_HEIGHT = 840
@@ -87,6 +98,9 @@ class GUIState:
     batch_list_theme: Optional[int] = None
     select_all_flash_theme: Optional[int] = None
     modified_sidebar_theme: Optional[int] = None
+    scewin_runner: Optional[SCEWINRunner] = None
+    pending_scewin_action: Optional[str] = None
+    pending_scewin_path: Optional[Path] = None
 
     def reset(self) -> None:
         self.blocks = []
@@ -769,7 +783,42 @@ def _range_error_message(min_value: Optional[int], max_value: Optional[int]) -> 
 
 
 def handle_change_request(change: "PendingChange") -> None:
+    risky = find_risky_blocks(state.blocks[idx] for idx in change.block_indices)
+    if not risky:
+        apply_pending_change(change)
+        return
+
+    state.pending_change = change
+    lines = [
+        "These questions touch settings that can leave the machine unbootable or without",
+        "input/display if set wrong. Make sure you have a way to clear CMOS before importing.",
+        "",
+    ]
+    for block, keywords in risky[:15]:
+        lines.append(f"- {block.name} [{', '.join(keywords)}]")
+    if len(risky) > 15:
+        lines.append(f"...and {len(risky) - 15} more.")
+    dpg.set_value("risk_confirm_text", "\n".join(lines))
+    dpg.configure_item("risk_confirm_modal", show=True)
+    append_log(f"Risky change requested for {len(risky)} question(s); waiting for confirmation.")
+
+
+def on_risk_confirm(sender: int, app_data: object) -> None:
+    dpg.configure_item("risk_confirm_modal", show=False)
+    change = state.pending_change
+    state.pending_change = None
+    if change is None:
+        return
+    append_log("Risky change confirmed by user.")
     apply_pending_change(change)
+
+
+def on_risk_cancel(sender: int, app_data: object) -> None:
+    dpg.configure_item("risk_confirm_modal", show=False)
+    state.pending_change = None
+    append_log("Risky change cancelled; nothing was modified.")
+    # Rebuild the controls so the radio button snaps back to the real current option.
+    render_selection()
 
 
 def apply_pending_change(change: "PendingChange") -> None:
@@ -861,7 +910,7 @@ def on_force_crc_toggle(sender: int, app_data: object) -> None:
     if unsafe_mode and has_crc:
         dpg.set_value(
             "force_crc_warning_text",
-            "Force override enabled with unsafe CRC mode. Removing/emptying HIICrc32 on files that contain a CRC "
+            "Force override enabled with unsafe CRC mode. Changing HIICrc32 on files that contain a CRC "
             "header can render firmware images unusable. Proceed only if you have recovery media.",
         )
         dpg.configure_item("force_crc_modal", show=True)
@@ -873,7 +922,7 @@ def on_crc_mode_change(sender: int, app_data: object) -> None:
     mode = _selected_bypass_mode()
     if _is_unsafe_crc_mode(mode):
         append_log(
-            "Unsafe CRC bypass selected: removing or emptying the HIICrc32 header may make the file unusable."
+            "Unsafe CRC bypass selected: changing the HIICrc32 header may make the file unusable."
         )
     _update_crc_warning_state()
 
@@ -886,7 +935,7 @@ def _selected_bypass_mode() -> str:
 
 
 def _is_unsafe_crc_mode(mode: str) -> bool:
-    return mode in {"remove", "empty"}
+    return mode in UNSAFE_CRC_BYPASS_MODES
 
 
 def _update_crc_warning_state() -> None:
@@ -922,7 +971,7 @@ def on_save(sender: int, app_data: object) -> None:
         summary += "\n\nCRC bypass is enabled."
         if _is_unsafe_crc_mode(bypass_crc_mode):
             summary += (
-                "\nWARNING: Unsafe CRC bypass selected. Removal/empty actions will be blocked when a HIICrc32 header "
+                "\nWARNING: Unsafe CRC bypass selected. It will be blocked when a HIICrc32 header "
                 "is present unless force is enabled."
             )
             if force_crc_bypass:
@@ -1078,6 +1127,208 @@ def open_file_dialog() -> None:
     on_file_selected(file_path)
 
 
+def _set_scewin_runner(directory: Path) -> bool:
+    try:
+        state.scewin_runner = SCEWINRunner(directory)
+    except SCEWINError as exc:
+        append_log(str(exc))
+        return False
+    if dpg.does_item_exist("scewin_dir_label"):
+        dpg.set_value("scewin_dir_label", f"SCEWIN: {state.scewin_runner.scewin_dir}")
+    append_log(f"Using SCEWIN from {state.scewin_runner.scewin_dir}.")
+    return True
+
+
+def detect_scewin_dir() -> None:
+    found = guess_scewin_dir(default_scewin_candidates())
+    if found is not None:
+        _set_scewin_runner(found)
+
+
+def on_choose_scewin_dir(sender: int, app_data: object) -> None:
+    root = Tk()
+    root.withdraw()
+    try:
+        chosen = filedialog.askdirectory(
+            title="Select the folder containing SCEWIN_64.exe", initialdir=_dialog_start_path()
+        )
+    finally:
+        root.destroy()
+    if chosen:
+        _set_scewin_runner(Path(chosen))
+
+
+def _require_scewin() -> Optional[SCEWINRunner]:
+    if state.scewin_runner is None:
+        append_log(
+            "No SCEWIN folder selected. Click 'Choose SCEWIN folder' and pick the folder with SCEWIN_64.exe "
+            "(get it with SCEHUB's DL_SCEWIN.exe: https://github.com/ab3lkaizen/SCEHUB)."
+        )
+    return state.scewin_runner
+
+
+def _default_script_path() -> Path:
+    if state.manager.path:
+        return Path(state.manager.path)
+    if state.scewin_runner is not None:
+        return state.scewin_runner.scewin_dir / DEFAULT_SCRIPT_NAME
+    return Path.cwd() / DEFAULT_SCRIPT_NAME
+
+
+def _report_scewin_result(result: SCEWINResult) -> None:
+    lines = result.summary_lines()
+    for line in lines:
+        append_log(line)
+    if not result.ok:
+        show_message("SCEWIN reported a problem", "\n".join(lines))
+
+
+def show_message(title: str, text: str) -> None:
+    dpg.set_value("message_title", title)
+    dpg.set_value("message_text", text)
+    dpg.configure_item("message_modal", show=True)
+
+
+def on_scewin_export(sender: int, app_data: object) -> None:
+    runner = _require_scewin()
+    if runner is None:
+        return
+    if state.modified_indices:
+        show_message(
+            "Unsaved changes",
+            "Exporting would overwrite the editor's view of the file. Save or discard your changes first.",
+        )
+        return
+
+    default_path = _default_script_path()
+    root = Tk()
+    root.withdraw()
+    try:
+        chosen = filedialog.asksaveasfilename(
+            title="Export NVRAM settings to",
+            initialdir=str(default_path.parent),
+            initialfile=default_path.name,
+            defaultextension=".txt",
+            filetypes=[("NVRAM script", "*.txt"), ("All files", "*.*")],
+        )
+    finally:
+        root.destroy()
+    if not chosen:
+        append_log("Export cancelled.")
+        return
+
+    script_path = Path(chosen)
+    append_log(f"Running SCEWIN export to {script_path} ...")
+    try:
+        result = runner.export(script_path)
+    except SCEWINError as exc:
+        append_log(str(exc))
+        show_message("Export failed", str(exc))
+        return
+    _report_scewin_result(result)
+    if result.ok and script_path.is_file():
+        on_file_selected(script_path)
+
+
+def _open_scewin_confirm(action: str, script_path: Path) -> None:
+    runner = state.scewin_runner
+    assert runner is not None
+
+    issues = runner.check_import(script_path)
+    if issues:
+        text = "Import blocked by preflight checks:\n- " + "\n- ".join(issues)
+        append_log(text)
+        show_message("Import blocked", text)
+        return
+
+    if action == "restore":
+        lines = [
+            f"Re-import the original export:\n{script_path}",
+            "",
+            "This puts every setting back to how it was when you first exported.",
+        ]
+        risky = False
+    else:
+        changes = runner.changes_since_export(script_path)
+        lines = [f"Write this file to NVRAM:\n{script_path}", ""]
+        if changes is None:
+            lines.append("No restore point exists for this file, so the changes cannot be listed.")
+            lines.append("Export from BIOS first so you have a way back.")
+            risky = False
+        elif not changes:
+            lines.append("No settings differ from the restore point.")
+            risky = False
+        else:
+            lines.append(f"{len(changes)} setting(s) differ from the restore point:")
+            lines.extend(f"- {change.format()}" for change in changes[:25])
+            if len(changes) > 25:
+                lines.append(f"...and {len(changes) - 25} more.")
+            risky = any(change.risk_keywords for change in changes)
+    lines += ["", "Changes take effect after a reboot."]
+
+    state.pending_scewin_action = action
+    state.pending_scewin_path = script_path
+    dpg.set_value("scewin_confirm_text", "\n".join(lines))
+    dpg.set_value("scewin_risk_ack", False)
+    dpg.configure_item("scewin_risk_ack", show=risky)
+    dpg.configure_item("scewin_confirm_modal", show=True)
+
+
+def on_scewin_import(sender: int, app_data: object) -> None:
+    if _require_scewin() is None:
+        return
+    if not state.manager.path:
+        append_log("Load or export an NVRAM file before importing.")
+        return
+    if state.modified_indices:
+        show_message("Unsaved changes", "Save your changes before importing; SCEWIN reads the file on disk.")
+        return
+    _open_scewin_confirm("import", Path(state.manager.path))
+
+
+def on_scewin_restore(sender: int, app_data: object) -> None:
+    if _require_scewin() is None:
+        return
+    restore_point = restore_point_path(_default_script_path().resolve())
+    if not restore_point.is_file():
+        show_message("No restore point", f"No restore point at:\n{restore_point}\nIt is created by the first export.")
+        return
+    _open_scewin_confirm("restore", restore_point)
+
+
+def on_scewin_cancel(sender: int, app_data: object) -> None:
+    dpg.configure_item("scewin_confirm_modal", show=False)
+    state.pending_scewin_action = None
+    state.pending_scewin_path = None
+    append_log("SCEWIN import cancelled; NVRAM was not touched.")
+
+
+def on_scewin_confirm(sender: int, app_data: object) -> None:
+    runner = state.scewin_runner
+    action = state.pending_scewin_action
+    script_path = state.pending_scewin_path
+    if runner is None or action is None or script_path is None:
+        dpg.configure_item("scewin_confirm_modal", show=False)
+        return
+    if dpg.get_item_configuration("scewin_risk_ack").get("show") and not dpg.get_value("scewin_risk_ack"):
+        append_log("Tick the risk acknowledgement before writing risky settings to NVRAM.")
+        return
+
+    dpg.configure_item("scewin_confirm_modal", show=False)
+    state.pending_scewin_action = None
+    state.pending_scewin_path = None
+    append_log(f"Running SCEWIN {action} from {script_path} ...")
+    try:
+        result = replace(runner.import_script(script_path), action=action)
+    except SCEWINError as exc:
+        append_log(str(exc))
+        show_message(f"{action.capitalize()} failed", str(exc))
+        return
+    _report_scewin_result(result)
+    if result.ok:
+        append_log("Reboot for the new NVRAM settings to take effect.")
+
+
 def apply_dark_theme() -> None:
     with dpg.theme() as dark_theme:
         with dpg.theme_component(dpg.mvAll):
@@ -1141,6 +1392,15 @@ def build_ui() -> None:
                 dpg.add_text("Setup Questions")
                 dpg.add_text("No file loaded", tag="loaded_file_label", color=(180, 180, 200))
                 dpg.add_button(label="Open NVRAM file", callback=lambda: open_file_dialog())
+                with dpg.collapsing_header(label="SCEWIN: read / write BIOS", default_open=True):
+                    dpg.add_text("SCEWIN: not selected", tag="scewin_dir_label", color=(180, 180, 200), wrap=300)
+                    dpg.add_button(label="Choose SCEWIN folder", callback=on_choose_scewin_dir)
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(label="Export from BIOS", callback=on_scewin_export)
+                        dpg.add_button(label="Import to BIOS", callback=on_scewin_import)
+                    dpg.add_button(label="Restore original", tag="scewin_restore_button", callback=on_scewin_restore)
+                    with dpg.tooltip(parent="scewin_restore_button"):
+                        dpg.add_text("Re-imports the untouched copy saved by your first export.")
                 dpg.add_input_text(
                     tag="search_input",
                     label="Search",
@@ -1218,7 +1478,7 @@ def build_ui() -> None:
                         show=False,
                     )
                     dpg.add_text(
-                        "Unsafe: removing or emptying HIICrc32 will be blocked when a CRC header is present unless forced.",
+                        "Unsafe: every bypass mode is blocked when a CRC header is present unless forced.",
                         tag="unsafe_crc_warning",
                         color=(255, 150, 150),
                         indent=12,
@@ -1228,7 +1488,7 @@ def build_ui() -> None:
                     dpg.add_radio_button(
                         tag="bypass_crc_mode_selector",
                         items=list(BYPASS_MODE_LABELS.keys()),
-                        default_value="Version placeholder",
+                        default_value="Empty CRC value (unsafe)",
                         indent=12,
                         horizontal=True,
                         callback=on_crc_mode_change,
@@ -1285,6 +1545,33 @@ def build_ui() -> None:
             dpg.add_button(label="Cancel", callback=on_force_crc_cancel)
             dpg.add_button(label="Proceed anyway", callback=on_force_crc_confirm)
 
+    with dpg.window(tag="risk_confirm_modal", modal=True, show=False, no_move=True, no_close=True, no_resize=True):
+        dpg.add_text("Confirm risky change", color=(255, 170, 120))
+        dpg.add_separator()
+        dpg.add_text("", tag="risk_confirm_text", wrap=520)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Cancel", callback=on_risk_cancel)
+            dpg.add_button(label="Apply anyway", callback=on_risk_confirm)
+
+    with dpg.window(tag="scewin_confirm_modal", modal=True, show=False, no_move=True, no_close=True, no_resize=True):
+        dpg.add_text("Write settings to NVRAM", color=(255, 170, 120))
+        dpg.add_separator()
+        dpg.add_text("", tag="scewin_confirm_text", wrap=620)
+        dpg.add_checkbox(
+            tag="scewin_risk_ack",
+            label="I understand some of these settings can stop the machine from booting, and I can clear CMOS.",
+            show=False,
+        )
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Cancel", callback=on_scewin_cancel)
+            dpg.add_button(label="Write to NVRAM", callback=on_scewin_confirm)
+
+    with dpg.window(tag="message_modal", modal=True, show=False, no_move=True, no_resize=True):
+        dpg.add_text("", tag="message_title")
+        dpg.add_separator()
+        dpg.add_text("", tag="message_text", wrap=560)
+        dpg.add_button(label="Close", callback=lambda sender, app_data: dpg.configure_item("message_modal", show=False))
+
     dpg.create_viewport(title="NVRAM Tweaker UI", width=1200, height=840, resizable=True)
     dpg.setup_dearpygui()
     dpg.show_viewport()
@@ -1293,7 +1580,8 @@ def build_ui() -> None:
     if hasattr(dpg, "set_viewport_resize_callback"):
         dpg.set_viewport_resize_callback(on_viewport_resize)
     dpg.set_primary_window("primary_window", True)
-    append_log("Ready. Load an NVRAM file to start.")
+    append_log("Ready. Load an NVRAM file, or export one from the BIOS with SCEWIN.")
+    detect_scewin_dir()
     dpg.start_dearpygui()
     dpg.destroy_context()
 

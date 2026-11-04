@@ -26,10 +26,33 @@ Key capabilities:
 - **Searchable question list** with token visibility and multi-selection (use *Select All Filtered* to build a batch).
 - **Context-aware controls:** radio buttons for option lists, numeric inputs for `Value =` blocks, and displayed help strings for each question.
 - **Batch edits:** apply the same option substring or numeric value across multiple selected questions with per-block compatibility checks.
-- **Safety prompts:** risk keywords open a modal dialog before applying changes.
+- **Safety prompts:** questions whose names match risk keywords (USB/XHCI, PCIe/ASPM, CSM, Secure Boot, TPM, voltages, power limits, SATA/NVMe, ...) open a confirmation dialog before the change is applied. The list lives in `nvram_safety.py`.
+- **Read and write the BIOS directly** through SCEWIN (see below): export, edit, import, and one-click restore.
 - **Inline logging:** the console panel captures load, change, skip, and save events. Saving writes a `.bak` backup and updates the loaded file in place.
 
-The window is resizable, uses a dark theme, and remembers the current selection while you filter or browse. Start by opening an NVRAM file, pick one or more questions, adjust the value/option, and click **Save changes** when you are satisfied.
+The window is resizable, uses a dark theme, and remembers the current selection while you filter or browse. Start by opening an NVRAM file (or exporting one from the BIOS), pick one or more questions, adjust the value/option, and click **Save changes** when you are satisfied.
+
+## Reading and writing the BIOS with SCEWIN
+
+nvram-tweaker can drive AMI's SCEWIN to get the NVRAM file from your machine and write your edits back. It does **not** ship SCEWIN. Get the `SCEWIN` folder (`SCEWIN_64.exe`, `amifldrv64.sys`, `amigendrv64.sys`) with [SCEHUB](https://github.com/ab3lkaizen/SCEHUB)'s `DL_SCEWIN.exe`, which extracts it from MSI Center. SCEWIN only works on Windows with an AMI BIOS and must run as administrator, so start nvram-tweaker as administrator.
+
+1. **Export from BIOS** saves the current settings (e.g. `nvram.txt`) and loads them in the editor. The first export also saves an untouched copy, `nvram.original.txt`: your **restore point**.
+2. Edit and **Save changes** as usual.
+3. **Import to BIOS** runs preflight checks (the file must round-trip through the parser and every option question needs exactly one `*`), shows every setting that differs from the restore point, and asks for an extra acknowledgement if any of them are risky. Reboot to apply.
+4. **Restore original** re-imports the restore point and puts every setting back.
+
+SCEWIN's output is saved to `log-file.txt` next to the script and explained in the console (driver not loaded, HII not published, write-protected variables, and so on).
+
+The same workflow from the command line:
+
+```bash
+python scewin_runner.py export  --scewin path\to\SCEWIN --file nvram.txt
+python scewin_runner.py import  --scewin path\to\SCEWIN --file nvram.txt
+python scewin_runner.py restore --scewin path\to\SCEWIN --file nvram.txt
+python scewin_runner.py diagnose log-file.txt   # explain an existing SCEWIN log (works on any OS)
+```
+
+If `--scewin` is omitted, the current folder and the app folder (and a `SCEWIN/<version>/` subfolder in either) are searched.
 
 ## Quick start (CLI, advanced)
 
@@ -53,11 +76,11 @@ python nvram_editor.py nvram.txt "Power Limit" 0x7d --mode value
 
 ### Safety and validation
 
-- Risky keywords (such as XHCI or ASPM) trigger an extra confirmation before any change is applied.
+- Risky keywords (such as XHCI or ASPM) require typing `YES` before any change is applied.
 - Hex input is automatically converted to decimal; the summary prints the conversion for clarity.
 - `Min =` / `Max =` ranges are enforced when present to prevent out-of-range writes.
 - Use `--dry-run` to preview changes without writing to disk.
-- CRC handling defaults to restoring the original `HIICrc32` header. Bypass modes that remove or empty the CRC are flagged as unsafe and are blocked when a CRC marker is detected unless you explicitly force the change. Prefer the placeholder mode if you must bypass CRCs.
+- CRC handling defaults to restoring the original `HIICrc32` header. Every bypass mode (empty, remove, placeholder) writes something other than the original checksum, so all of them are flagged as unsafe and blocked when a CRC marker is detected unless you explicitly force the change.
 
 ### What gets written
 

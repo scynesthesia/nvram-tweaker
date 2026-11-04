@@ -33,12 +33,16 @@ from nvram_parsing import (
     validate_numeric_input,
 )
 from nvram_reconstruction import rebuild_text
+from nvram_safety import find_risky_blocks
 from nvram_structures import OptionField, QuestionBlock, ValueField
 
 LOGGER = logging.getLogger(__name__)
 
 MMAP_READ_THRESHOLD = 4 * 1024 * 1024
 TOOL_VERSION = "0.0.0-dev"
+# Every bypass mode writes something other than the original checksum, so all of
+# them need an explicit force when the file carries a HIICrc32 header.
+UNSAFE_CRC_BYPASS_MODES = frozenset({"remove", "empty", "placeholder"})
 
 def _read_file_via_mmap(path: Path) -> bytes:
     """
@@ -232,12 +236,12 @@ class NVRAMManager:
         if (
             bypass_crc
             and not force_crc_bypass
-            and bypass_crc_mode in {"remove", "empty"}
+            and bypass_crc_mode in UNSAFE_CRC_BYPASS_MODES
             and self.has_crc_marker
         ):
             raise ValueError(
-                "Unsafe CRC bypass blocked: refusing to remove or empty HIICrc32 when a CRC marker is present. "
-                "Enable force mode to proceed."
+                "Unsafe CRC bypass blocked: refusing to remove, empty or overwrite HIICrc32 with a placeholder "
+                "when a CRC marker is present. Enable force mode to proceed."
             )
         if self.path is None:
             raise ValueError("No file is currently loaded; cannot save changes.")
@@ -510,6 +514,16 @@ def main() -> int:
         for idx in target_indices:
             LOGGER.info("- %s", before_descriptions[idx])
             LOGGER.info("  -> %s", after_descriptions[idx])
+
+        risky = find_risky_blocks(blocks[idx] for idx in target_indices)
+        if risky:
+            LOGGER.warning("WARNING: these questions touch settings that can leave the machine unbootable")
+            LOGGER.warning("or without input/display if set wrong:")
+            for block, keywords in risky:
+                LOGGER.warning("  - %s [%s]", block.name, ", ".join(keywords))
+            risk_confirmation = input("Type YES to confirm you want to change risky settings: ").strip()
+            if risk_confirmation.lower() != "yes":
+                raise ValueError("No changes applied; risky change not confirmed.")
 
         confirmation = input("Apply these changes? (Y/N): ").strip().lower()
         if confirmation not in {"y", "yes"}:
