@@ -103,15 +103,72 @@ def test_warnings_do_not_count_as_errors() -> None:
     "name, expected",
     [
         ("XHCI Hand-off", ["XHCI"]),
-        ("Legacy USB Support", ["USB"]),
-        ("Native ASPM", ["ASPM"]),
         ("AMD fTPM switch", ["fTPM"]),
+        ("Erase fTPM NV for factory reset", ["fTPM", "Erase"]),
+        ("CPU Core Voltage", ["Voltage"]),
+        ("Primary Video Adaptor", ["Primary Video"]),
+        ("BIOS CSM/UEFI Mode", ["CSM"]),
+        # note-level words never ask for confirmation
+        ("Legacy USB Support", []),
+        ("Native ASPM", []),
+        ("OnChip SATA Type", []),
         ("Fan Start Temperature", []),
         ("Busy Wait", []),
     ],
 )
 def test_risky_keywords(name: str, expected: List[str]) -> None:
     assert nvram_safety.risky_keywords(name) == expected
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("Legacy USB Support", ["USB"]),
+        ("Native ASPM", ["ASPM"]),
+        ("OnChip SATA Type", ["SATA"]),
+        ("PCIE PORT 0", ["PCIe"]),
+        ("XHCI Hand-off", []),
+        ("Fan Start Temperature", []),
+    ],
+)
+def test_noted_keywords(name: str, expected: List[str]) -> None:
+    assert nvram_safety.noted_keywords(name) == expected
+
+
+def test_diff_marks_note_level_changes_without_flagging_risk() -> None:
+    before = "Setup Question = OnChip SATA Type\nOptions =*[00]AHCI\n         [01]RAID\n"
+    after = "Setup Question = OnChip SATA Type\nOptions =[00]AHCI\n         *[01]RAID\n"
+    (change,) = nvram_safety.diff_texts(before, after)
+    assert change.risk_keywords == () and change.note_keywords == ("SATA",)
+    assert "[note: SATA]" in change.format() and "RISK" not in change.format()
+
+
+# --- truncated or damaged files --------------------------------------------
+
+
+def test_missing_questions_finds_what_a_truncated_file_lost() -> None:
+    original = SAMPLE_EXPORT
+    truncated = original[: original.index("Setup Question\t= Fan Start Temperature")]
+    assert nvram_safety.missing_questions(original, truncated) == ["Fan Start Temperature"]
+    assert nvram_safety.missing_questions(original, original) == []
+
+
+def test_commenting_a_question_out_is_not_missing() -> None:
+    original = SAMPLE_EXPORT
+    skipped = original.replace("Setup Question\t= XHCI Hand-off", "// Setup Question\t= XHCI Hand-off")
+    assert nvram_safety.missing_questions(original, skipped) == []
+
+
+def test_import_is_blocked_when_the_file_lost_questions(tmp_path: Path, scewin_dir: Path) -> None:
+    run = FakeRun()
+    runner = make_runner(scewin_dir, run)
+    script = tmp_path / "nvram.txt"
+    runner.export(script)
+    script.write_text(SAMPLE_EXPORT[: SAMPLE_EXPORT.index("Setup Question\t= XHCI Hand-off")], encoding="utf-8")
+
+    with pytest.raises(scewin_runner.SCEWINError, match=r"2 question\(s\) .* gone"):  # XHCI + the one after it
+        runner.import_script(script)
+    assert all("/i" not in call for call in run.calls)
 
 
 def test_preflight_accepts_a_clean_export() -> None:

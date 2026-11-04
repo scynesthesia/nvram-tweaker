@@ -1,10 +1,16 @@
 """Safety checks shared by the CLI, the GUI and the SCEWIN runner.
 
-* :func:`risky_keywords` flags question names that touch settings which can
-  leave a machine without input, display or boot (USB/XHCI, PCIe/ASPM, CSM,
-  voltages, ...). Callers ask for an extra confirmation when it returns matches.
+* :func:`risky_keywords` flags question names whose change can lock a board or
+  harm hardware (XHCI, CSM, Secure Boot, TPM, voltages, power limits, ...).
+  Callers ask for an explicit confirmation when it returns matches.
+* :func:`noted_keywords` flags settings worth a second look (SATA, USB, PCIe,
+  ASPM, ...) that are only marked in the change list, without a prompt. On a
+  real export a quarter of all questions mention one of these words, so asking
+  about every one would teach people to click through.
 * :func:`diff_blocks` lists the settings that differ between two parsed files,
   e.g. the untouched restore point and the file about to be imported.
+* :func:`missing_questions` finds questions that vanished from a file, which
+  means it was truncated or damaged.
 * :func:`preflight_issues` catches problems SCEWIN would choke on before the
   file is written to NVRAM.
 """
@@ -19,23 +25,19 @@ from nvram_parsing import find_blocks
 from nvram_reconstruction import rebuild_text
 from nvram_structures import OptionField, QuestionBlock, ValueField
 
-# Settings that commonly cause lost input/display, failed boots or hardware stress
-# when changed blindly. Matching is case-insensitive on word boundaries.
-RISK_KEYWORDS: Tuple[str, ...] = (
+# Changing these blindly can leave a machine without input, display or boot, wipe
+# security state, or stress hardware. Matching is case-insensitive on word boundaries.
+CONFIRM_KEYWORDS: Tuple[str, ...] = (
     "XHCI",
-    "USB",
-    "ASPM",
-    "PCIe",
-    "PCI Express",
     "CSM",
     "Secure Boot",
-    "Fast Boot",
     "TPM",
     "fTPM",
     "PTT",
     "iGPU",
     "IGD",
     "Primary Display",
+    "Primary Video",
     "Voltage",
     "VCore",
     "Power Limit",
@@ -43,27 +45,49 @@ RISK_KEYWORDS: Tuple[str, ...] = (
     "PL2",
     "IccMax",
     "Current Limit",
+    "BIOS Lock",
+    "Flash Protection",
+    "Erase",
+)
+
+# Worth noticing in the change list, but too common to prompt for.
+NOTE_KEYWORDS: Tuple[str, ...] = (
+    "USB",
+    "ASPM",
+    "PCIe",
+    "PCI Express",
     "SATA",
     "NVMe",
     "VMD",
-    "BIOS Lock",
-    "Flash Protection",
+    "Fast Boot",
     "Watchdog",
 )
 
 # SCEWIN appends a '// Move "*" to the desired Option' hint to option lines.
 _INLINE_COMMENT = re.compile(r"\s//")
 
-_RISK_PATTERNS = tuple(
-    (keyword, re.compile(rf"(?<![A-Za-z0-9]){re.escape(keyword)}(?![A-Za-z])", re.IGNORECASE))
-    for keyword in RISK_KEYWORDS
-)
+
+def _compile(keywords: Iterable[str]) -> Tuple[Tuple[str, "re.Pattern[str]"], ...]:
+    return tuple(
+        (keyword, re.compile(rf"(?<![A-Za-z0-9]){re.escape(keyword)}(?![A-Za-z])", re.IGNORECASE))
+        for keyword in keywords
+    )
+
+
+_CONFIRM_PATTERNS = _compile(CONFIRM_KEYWORDS)
+_NOTE_PATTERNS = _compile(NOTE_KEYWORDS)
 
 
 def risky_keywords(name: str) -> List[str]:
-    """Return the risk keywords found in a question name (empty if none)."""
+    """Return the confirm-level keywords found in a question name (empty if none)."""
 
-    return [keyword for keyword, pattern in _RISK_PATTERNS if pattern.search(name)]
+    return [keyword for keyword, pattern in _CONFIRM_PATTERNS if pattern.search(name)]
+
+
+def noted_keywords(name: str) -> List[str]:
+    """Return the note-level keywords found in a question name (empty if none)."""
+
+    return [keyword for keyword, pattern in _NOTE_PATTERNS if pattern.search(name)]
 
 
 def find_risky_blocks(blocks: Iterable[QuestionBlock]) -> List[Tuple[QuestionBlock, List[str]]]:
@@ -99,10 +123,13 @@ class SettingChange:
     before: Optional[str]
     after: Optional[str]
     risk_keywords: Tuple[str, ...]
+    note_keywords: Tuple[str, ...] = ()
 
     def format(self) -> str:
         token = self.token or "None"
         flag = f"  [RISK: {', '.join(self.risk_keywords)}]" if self.risk_keywords else ""
+        if self.note_keywords:
+            flag += f"  [note: {', '.join(self.note_keywords)}]"
         return f"{self.name} (Token: {token}): {self.before or '<none>'} -> {self.after or '<none>'}{flag}"
 
 
@@ -141,6 +168,7 @@ def diff_blocks(before: Iterable[QuestionBlock], after: Iterable[QuestionBlock])
                     before=old,
                     after=new,
                     risk_keywords=tuple(risky_keywords(after_block.name)),
+                    note_keywords=tuple(noted_keywords(after_block.name)),
                 )
             )
     for key, before_block in before_map.items():
@@ -152,6 +180,7 @@ def diff_blocks(before: Iterable[QuestionBlock], after: Iterable[QuestionBlock])
                     before=current_setting(before_block),
                     after=None,
                     risk_keywords=tuple(risky_keywords(before_block.name)),
+                    note_keywords=tuple(noted_keywords(before_block.name)),
                 )
             )
     return changes
@@ -163,8 +192,35 @@ def diff_texts(before_text: str, after_text: str) -> List[SettingChange]:
     return diff_blocks(before_blocks, after_blocks)
 
 
+def missing_questions(reference_text: str, candidate_text: str) -> List[str]:
+    """Names of live questions in ``reference_text`` that ``candidate_text`` lost.
+
+    A question that was commented out in the candidate counts as present: that is
+    how a user deliberately skips a setting SCEWIN cannot write. One that is gone
+    altogether means the file was truncated or damaged.
+    """
+
+    wanted: Counter[Tuple[str, Optional[str]]] = Counter()
+    for block in find_blocks(reference_text)[0]:
+        if not block.is_commented:
+            wanted[(block.name, block.token)] += 1
+    present: Counter[Tuple[str, Optional[str]]] = Counter()
+    for block in find_blocks(candidate_text)[0]:
+        present[(block.name, block.token)] += 1  # live or commented-out
+
+    missing: List[str] = []
+    for key, count in wanted.items():
+        missing.extend([key[0]] * max(0, count - present[key]))
+    return missing
+
+
 def preflight_issues(text: str) -> List[str]:
-    """Return reasons the text should not be imported (empty list means OK)."""
+    """Return reasons the text should not be imported (empty list means OK).
+
+    The parser round-trip below is a sanity check only: the parser keeps every
+    byte it does not understand, so it holds for almost any text. The checks that
+    can actually fail are the '*' counts here and :func:`missing_questions`.
+    """
 
     issues: List[str] = []
     blocks, trailing = find_blocks(text)
@@ -189,12 +245,15 @@ def preflight_issues(text: str) -> List[str]:
 
 
 __all__ = [
-    "RISK_KEYWORDS",
+    "CONFIRM_KEYWORDS",
+    "NOTE_KEYWORDS",
     "SettingChange",
     "current_setting",
     "diff_blocks",
     "diff_texts",
     "find_risky_blocks",
+    "missing_questions",
+    "noted_keywords",
     "preflight_issues",
     "risky_keywords",
 ]

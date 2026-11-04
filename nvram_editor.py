@@ -239,9 +239,14 @@ class NVRAMManager:
             raise ValueError(
                 "Detected divergence after re-parsing the pending changes; save aborted to prevent data loss."
             )
-        # Edits only move '*' or change numbers, so the questions themselves must be unchanged.
-        # A merged or lost line would still round-trip, so compare the question list too.
-        if [b.name for b in reparsed_blocks] != [b.name for b in self.blocks]:
+        # The round-trip above is only a sanity check: the parser keeps any text it does not
+        # understand, so it holds for almost anything. This is the check that can fail.
+        # Edits only move '*' or change numbers, so the list of questions must be identical;
+        # a merged, lost or un-commented question would still round-trip.
+        def identity(blocks):
+            return [(b.name, b.token, b.is_commented) for b in blocks]
+
+        if identity(reparsed_blocks) != identity(self.blocks):
             raise ValueError(
                 "The pending changes would add, remove or merge Setup Questions; save aborted to prevent data loss."
             )

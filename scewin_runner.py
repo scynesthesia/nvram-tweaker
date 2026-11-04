@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence
 
 from nvram_crc import crc_header_mismatch
-from nvram_safety import SettingChange, diff_texts, preflight_issues
+from nvram_safety import SettingChange, diff_texts, missing_questions, preflight_issues
 from scewin_diagnostics import REFERENCE_URL, Diagnosis, diagnose, has_errors
 
 SCEWIN_EXE = "SCEWIN_64.exe"
@@ -173,10 +173,19 @@ class SCEWINRunner:
 
         restore_point = restore_point_path(script_path)
         if restore_point.is_file() and restore_point.resolve() != script_path.resolve():
-            mismatch = crc_header_mismatch(_read_text(restore_point), text)
+            original = _read_text(restore_point)
+            mismatch = crc_header_mismatch(original, text)
             if mismatch:
                 issues.append(
                     f"{mismatch} If you updated the BIOS, delete '{restore_point.name}' and export again."
+                )
+            missing = missing_questions(original, text)
+            if missing:
+                shown = ", ".join(f"'{name}'" for name in missing[:3])
+                more = f" and {len(missing) - 3} more" if len(missing) > 3 else ""
+                issues.append(
+                    f"{len(missing)} question(s) from your original export are gone from this file ({shown}{more}). "
+                    "It may be truncated or damaged. (Commenting a question out with // is fine.)"
                 )
         return issues
 
