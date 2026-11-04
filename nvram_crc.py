@@ -6,60 +6,88 @@ it is running on, so editing settings never makes it stale and the tool never
 rewrites it. Changing or removing it only defeats that check: a script exported
 from another BIOS version could then be imported.
 
-The helpers here read the header, put it back if an edit dropped it, and report
-when two scripts carry different headers (i.e. come from different BIOS builds).
+Real exports put the header on line 6, after a block of ``//`` comments, and end
+some header lines with ``\\r\\r\\n``. Everything here works on the raw text and
+touches nothing but the header line itself, so every other byte survives.
+
+The helpers read the header, put it back if an edit dropped it, and report when
+two scripts carry different headers (i.e. come from different BIOS builds).
 """
 from __future__ import annotations
 
-from typing import List, Optional
+import re
+from typing import Optional
 
 CRC_HEADER_PREFIX = "HIICrc32"
 
+# Where the first question starts; the header can only live in the text before it.
+_FIRST_QUESTION = re.compile(r"(?m)^[ \t]*(?://[ \t]*)?Setup[ \t]+Question")
+# The header line's content, without its line terminator (which may be \r\r\n).
+_HEADER_LINE = re.compile(r"(?m)^[ \t]*" + CRC_HEADER_PREFIX + r"[^\r\n]*")
+
+
+def _header_region_end(text: str) -> int:
+    match = _FIRST_QUESTION.search(text)
+    return match.start() if match else len(text)
+
+
+def _find_header(text: str) -> Optional["re.Match[str]"]:
+    return _HEADER_LINE.search(text, 0, _header_region_end(text))
+
 
 def extract_crc_header(text: str) -> Optional[str]:
-    """Return the ``HIICrc32`` line (without its line ending) if it is the first line."""
+    """Return the ``HIICrc32`` line (without its line ending) if the header has one."""
 
-    first_line = text.splitlines()[0] if text else ""
-    if first_line.lstrip().startswith(CRC_HEADER_PREFIX):
-        return first_line
-    return None
+    match = _find_header(text)
+    return match.group(0) if match else None
 
 
-def _find_insertion_index(lines: List[str]) -> int:
-    index = 0
-    while index < len(lines):
-        stripped = lines[index].lstrip()
-        if stripped == "" or stripped.startswith(("#", "//", ";")):
-            index += 1
-            continue
-        break
-    return index
+def _insertion_offset(text: str) -> int:
+    """Offset just after the last comment line of the leading block (0 if there is none)."""
+
+    offset = 0
+    after_last_comment = 0
+    # Split on "\n" only: str.splitlines() would also cut at the lone "\r" inside "\r\r\n".
+    for line in re.findall(r"[^\n]*\n|[^\n]+\Z", text[: _header_region_end(text)]):
+        stripped = line.strip()
+        if stripped.startswith(("//", "#", ";")):
+            offset += len(line)
+            after_last_comment = offset
+        elif stripped == "":
+            offset += len(line)
+        else:
+            break
+    return after_last_comment
+
+
+def _line_ending(text: str) -> str:
+    return "\r\n" if "\r\n" in text else "\n"
 
 
 def preserve_crc_header(new_content: str, original_header: Optional[str]) -> str:
     """Return ``new_content`` carrying ``original_header`` verbatim.
 
-    An existing ``HIICrc32`` line is replaced with the original one; if the line
-    is missing it is inserted at the top (after leading comments). Content without
-    an original header is returned unchanged.
+    An existing ``HIICrc32`` line is replaced with the original one (only the
+    line's content changes, never its line ending); if the line is missing it is
+    inserted after the leading comments. Content without an original header is
+    returned unchanged.
     """
 
     if not original_header:
         return new_content
 
-    lines = new_content.splitlines()
-    had_trailing_newline = new_content.endswith(("\n", "\r"))
-    for index, line in enumerate(lines):
-        if line.lstrip().startswith(CRC_HEADER_PREFIX):
-            if line == original_header:
-                return new_content
-            lines[index] = original_header
-            break
-    else:
-        lines.insert(_find_insertion_index(lines), original_header)
-        had_trailing_newline = had_trailing_newline or len(lines) == 1
+    match = _find_header(new_content)
+    if match:
+        if match.group(0) == original_header:
+            return new_content
+        return new_content[: match.start()] + original_header + new_content[match.end() :]
 
-    return "\n".join(lines) + ("\n" if had_trailing_newline else "")
+    offset = _insertion_offset(new_content)
+    eol = _line_ending(new_content)
+    prefix = new_content[:offset]
+    if prefix and not prefix.endswith(("\n", "\r")):
+        prefix += eol
+    return prefix + original_header + eol + new_content[offset:]
 
 
 def crc_header_mismatch(reference_text: str, candidate_text: str) -> Optional[str]:

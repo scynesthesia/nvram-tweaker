@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -45,13 +47,30 @@ def _decode_bytes(raw_bytes: bytes, path: Path) -> tuple[str, str]:
         return raw_bytes.decode("latin-1"), "latin-1"
 
 
+def _write_atomically(path: Path, data: bytes) -> None:
+    """Replace ``path`` with ``data`` so a crash can never leave a half-written file."""
+
+    temp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        with temp_path.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            shutil.copymode(path, temp_path)
+        except OSError:
+            pass  # keep default permissions if the original's cannot be read
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 class NVRAMManager:
     def __init__(self) -> None:
         self.path: Optional[Path] = None
         self.blocks: List[QuestionBlock] = []
         self.trailing_text: str = ""
         self.initial_crc: Optional[str] = None
-        self.line_ending: str = "\n"
         self._encoding: str = "utf-8"
         self.last_saved_text: Optional[str] = None
 
@@ -74,14 +93,7 @@ class NVRAMManager:
         self.path = path
         self.last_saved_text = text
         self.initial_crc = extract_crc_header(text)
-        self.line_ending = "\r\n" if "\r\n" in text else "\n"
         return self
-
-    def _normalize_newlines(self, content: str) -> str:
-        content = content.replace("\r\n", "\n").replace("\r", "\n")
-        if self.line_ending == "\n":
-            return content
-        return self.line_ending.join(content.split("\n"))
 
     def update_value(self, block: QuestionBlock, new_value: int) -> QuestionBlock:
         body = block.body
@@ -146,7 +158,8 @@ class NVRAMManager:
             prefix = opt_match.group("prefix")
             code = opt_match.group("code")
             label = opt_match.group("label").rstrip("\r\n")
-            line_ending = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
+            # Keep the line's real terminator, including odd ones such as "\r\r\n".
+            line_ending = line[len(line.rstrip("\r\n")) :]
 
             is_target = option_counter == target_option_index
             if is_target:
@@ -195,12 +208,13 @@ class NVRAMManager:
                 "overwriting external edits."
             )
 
-        backup_path = path.with_name(path.name + ".bak")
-        backup_path.write_text(current_disk_text, encoding=self._encoding)
+        # A byte-for-byte copy: re-encoding or newline translation would alter the backup.
+        shutil.copyfile(path, path.with_name(path.name + ".bak"))
 
+        # Edits keep each line's own ending, so no newline conversion is done here:
+        # real exports mix \r\n and \r\r\n and must be written back exactly.
         updated_content = preserve_crc_header(new_content, self.initial_crc)
-        updated_content = self._normalize_newlines(updated_content)
-        path.write_text(updated_content, encoding=self._encoding, newline="")
+        _write_atomically(path, updated_content.encode(self._encoding))
         self.last_saved_text = updated_content
         self._refresh_state_from_text(updated_content)
 
@@ -249,7 +263,6 @@ class NVRAMManager:
         except re.error as exc:
             raise ValueError(f"Unable to re-parse content after save: {exc}") from exc
         self.initial_crc = extract_crc_header(text)
-        self.line_ending = "\r\n" if "\r\n" in text else "\n"
 
 
 def describe_block(block: QuestionBlock) -> str:
