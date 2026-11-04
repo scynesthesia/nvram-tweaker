@@ -237,17 +237,62 @@ def test_cli_diagnose_explains_a_log(tmp_path: Path, capsys) -> None:
     assert "Publish HII Resources" in capsys.readouterr().out
 
 
-# --- editor CRC guard ------------------------------------------------------
+# --- value edits -----------------------------------------------------------
 
 
-def test_save_blocks_placeholder_crc_bypass_unless_forced(tmp_path: Path) -> None:
+def test_value_edit_keeps_line_ending_and_next_question(tmp_path: Path) -> None:
+    text = (
+        "Setup Question = Fan\nValue\t=<30>\n"
+        "Setup Question = USB Power\nOptions =*[00]Disabled\n         [01]Enabled\n"
+    )
+    path = tmp_path / "nvram.txt"
+    path.write_text(text, encoding="utf-8")
+    manager = nvram_editor.NVRAMManager().load_file(path)
+    blocks = list(manager.blocks)
+    blocks[0] = manager.update_value(blocks[0], 45)
+    manager.save(path, manager.rebuild_text(blocks))
+
+    assert path.read_text(encoding="utf-8") == text.replace("<30>", "<45>")
+
+
+def test_save_refuses_to_lose_questions(tmp_path: Path) -> None:
+    text = "Setup Question = Fan\nValue = <30>\nSetup Question = USB Power\nValue = <1>\n"
+    path = tmp_path / "nvram.txt"
+    path.write_text(text, encoding="utf-8")
+    manager = nvram_editor.NVRAMManager().load_file(path)
+
+    merged = text.replace("<30>\n", "<30>")
+    with pytest.raises(ValueError, match="add, remove or merge"):
+        manager.save(path, merged)
+    assert path.read_text(encoding="utf-8") == text
+
+
+# --- HIICrc32 header -------------------------------------------------------
+
+
+def test_import_blocked_when_header_differs_from_restore_point(tmp_path: Path, scewin_dir: Path) -> None:
+    run = FakeRun()
+    runner = make_runner(scewin_dir, run)
+    script = tmp_path / "nvram.txt"
+    runner.export(script)
+    script.write_text(SAMPLE_EXPORT.replace("HIICrc32= 5B2C3F1A", "HIICrc32= 11111111"), encoding="utf-8")
+
+    issues = runner.check_import(script)
+    assert any("different BIOS version" in issue for issue in issues)
+    with pytest.raises(scewin_runner.SCEWINError, match="different BIOS version"):
+        runner.import_script(script)
+    assert all("/i" not in call for call in run.calls)
+
+
+def test_edit_and_save_keep_exported_header(tmp_path: Path) -> None:
     path = tmp_path / "nvram.txt"
     path.write_text(SAMPLE_EXPORT, encoding="utf-8")
     manager = nvram_editor.NVRAMManager().load_file(path)
-    new_text = manager.rebuild_text()
+    fan = next(i for i, b in enumerate(manager.blocks) if b.name == "Fan Start Temperature")
+    blocks = list(manager.blocks)
+    blocks[fan] = manager.update_value(blocks[fan], 45)
+    manager.save(path, manager.rebuild_text(blocks))
 
-    with pytest.raises(ValueError, match="Unsafe CRC bypass blocked"):
-        manager.save(path, new_text, bypass_crc=True, bypass_crc_mode="placeholder")
-
-    manager.save(path, new_text, bypass_crc=True, bypass_crc_mode="placeholder", force_crc_bypass=True)
-    assert path.read_text(encoding="utf-8").startswith("HIICrc32=<bypassed by nvram-tweaker")
+    saved = path.read_text(encoding="utf-8")
+    assert saved.splitlines()[0] == "HIICrc32= 5B2C3F1A"
+    assert nvram_safety.preflight_issues(saved) == []

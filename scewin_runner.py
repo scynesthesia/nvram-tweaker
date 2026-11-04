@@ -11,7 +11,8 @@ Workflow
    restore point.
 2. Edit the script with the CLI editor or the GUI.
 3. ``import``: preflight checks (parser round-trip, exactly one ``*`` per option
-   question), then ``SCEWIN_64.exe /i /s <script>``.
+   question, same ``HIICrc32`` header as the restore point), then
+   ``SCEWIN_64.exe /i /s <script>``.
 4. ``restore``: import the restore point to put every setting back.
 
 Every run writes SCEWIN's output to ``log-file.txt`` next to the script and is
@@ -31,6 +32,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence
 
+from nvram_crc import crc_header_mismatch
 from nvram_safety import SettingChange, diff_texts, preflight_issues
 from scewin_diagnostics import REFERENCE_URL, Diagnosis, diagnose, has_errors
 
@@ -166,7 +168,17 @@ class SCEWINRunner:
         script_path = Path(script_path)
         if not script_path.is_file():
             return [f"Script file '{script_path}' does not exist."]
-        return preflight_issues(_read_text(script_path))
+        text = _read_text(script_path)
+        issues = preflight_issues(text)
+
+        restore_point = restore_point_path(script_path)
+        if restore_point.is_file() and restore_point.resolve() != script_path.resolve():
+            mismatch = crc_header_mismatch(_read_text(restore_point), text)
+            if mismatch:
+                issues.append(
+                    f"{mismatch} If you updated the BIOS, delete '{restore_point.name}' and export again."
+                )
+        return issues
 
     def changes_since_export(self, script_path: Path) -> Optional[List[SettingChange]]:
         """Settings that differ from the restore point, or None if there is no restore point."""

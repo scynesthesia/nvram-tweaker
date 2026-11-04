@@ -13,7 +13,6 @@ from nvram_editor import (
     NVRAMManager,
     QuestionBlock,
     OPTION_LINE_PATTERN,
-    UNSAFE_CRC_BYPASS_MODES,
     VALUE_PATTERN,
     validate_numeric_input,
     apply_changes,
@@ -36,11 +35,6 @@ def resource_path(relative_path: str) -> str:
 
 
 INLINE_COMMENT_PATTERN = re.compile(r"\s//")
-BYPASS_MODE_LABELS = {
-    "Empty CRC value (unsafe)": "empty",
-    "Remove CRC line (unsafe)": "remove",
-    "Version placeholder (unsafe)": "placeholder",
-}
 DEFAULT_VIEWPORT_WIDTH = 1200
 DEFAULT_VIEWPORT_HEIGHT = 840
 SIDEBAR_WIDTH_MIN = 320
@@ -552,10 +546,6 @@ def update_detail_wraps() -> None:
         dpg.configure_item("question_token", wrap=wrap_width)
     if dpg.does_item_exist("help_text"):
         dpg.configure_item("help_text", width=wrap_width)
-    if dpg.does_item_exist("bypass_crc_warning"):
-        dpg.configure_item("bypass_crc_warning", wrap=wrap_width)
-    if dpg.does_item_exist("unsafe_crc_warning"):
-        dpg.configure_item("unsafe_crc_warning", wrap=wrap_width)
     if dpg.does_item_exist("control_region"):
         dpg.configure_item("control_region", width=content_width)
     if dpg.does_item_exist("sidebar"):
@@ -888,73 +878,6 @@ def on_value_change(sender: int, app_data: object, user_data: Dict[str, object])
     handle_change_request(pending)
 
 
-def on_toggle_bypass_crc(sender: int, app_data: object) -> None:
-    bypass_active = bool(app_data)
-    if dpg.does_item_exist("bypass_crc_mode_selector"):
-        dpg.configure_item("bypass_crc_mode_selector", enabled=bypass_active)
-
-    if bypass_active:
-        append_log("CRC bypass enabled: output will not carry a validated checksum.")
-    _update_crc_warning_state()
-
-
-def on_force_crc_toggle(sender: int, app_data: object) -> None:
-    force_enabled = bool(app_data)
-    mode = _selected_bypass_mode()
-    unsafe_mode = _is_unsafe_crc_mode(mode)
-    has_crc = getattr(state.manager, "has_crc_marker", False)
-
-    if not force_enabled:
-        return
-
-    if unsafe_mode and has_crc:
-        dpg.set_value(
-            "force_crc_warning_text",
-            "Force override enabled with unsafe CRC mode. Changing HIICrc32 on files that contain a CRC "
-            "header can render firmware images unusable. Proceed only if you have recovery media.",
-        )
-        dpg.configure_item("force_crc_modal", show=True)
-    elif unsafe_mode:
-        append_log("Force override enabled while using unsafe CRC mode on a file without detectable CRC header.")
-
-
-def on_crc_mode_change(sender: int, app_data: object) -> None:
-    mode = _selected_bypass_mode()
-    if _is_unsafe_crc_mode(mode):
-        append_log(
-            "Unsafe CRC bypass selected: changing the HIICrc32 header may make the file unusable."
-        )
-    _update_crc_warning_state()
-
-
-def _selected_bypass_mode() -> str:
-    if dpg.does_item_exist("bypass_crc_mode_selector"):
-        label = str(dpg.get_value("bypass_crc_mode_selector"))
-        return BYPASS_MODE_LABELS.get(label, "empty")
-    return "empty"
-
-
-def _is_unsafe_crc_mode(mode: str) -> bool:
-    return mode in UNSAFE_CRC_BYPASS_MODES
-
-
-def _update_crc_warning_state() -> None:
-    bypass_active = bool(dpg.get_value("bypass_crc_checkbox")) if dpg.does_item_exist("bypass_crc_checkbox") else False
-    mode = _selected_bypass_mode()
-    unsafe_mode = bypass_active and _is_unsafe_crc_mode(mode)
-
-    if dpg.does_item_exist("bypass_crc_warning"):
-        dpg.configure_item("bypass_crc_warning", show=bypass_active)
-
-    if dpg.does_item_exist("unsafe_crc_warning"):
-        dpg.configure_item("unsafe_crc_warning", show=unsafe_mode)
-
-    if dpg.does_item_exist("force_crc_bypass_checkbox"):
-        dpg.configure_item("force_crc_bypass_checkbox", show=unsafe_mode)
-        if not unsafe_mode:
-            dpg.set_value("force_crc_bypass_checkbox", False)
-
-
 def on_save(sender: int, app_data: object) -> None:
     if not state.manager.path:
         append_log("No file loaded. Load a file before saving changes.")
@@ -962,20 +885,6 @@ def on_save(sender: int, app_data: object) -> None:
 
     total_changes = len(state.modified_indices)
     summary = f"You are about to modify {total_changes} option(s). Do you want to continue?"
-    bypass_crc = bool(dpg.get_value("bypass_crc_checkbox")) if dpg.does_item_exist("bypass_crc_checkbox") else False
-    bypass_crc_mode = _selected_bypass_mode()
-    force_crc_bypass = (
-        bool(dpg.get_value("force_crc_bypass_checkbox")) if dpg.does_item_exist("force_crc_bypass_checkbox") else False
-    )
-    if bypass_crc:
-        summary += "\n\nCRC bypass is enabled."
-        if _is_unsafe_crc_mode(bypass_crc_mode):
-            summary += (
-                "\nWARNING: Unsafe CRC bypass selected. It will be blocked when a HIICrc32 header "
-                "is present unless force is enabled."
-            )
-            if force_crc_bypass:
-                summary += "\nForce override is ON. Proceed with caution."
 
     if state.modified_indices:
         lines = ["", "Changes to be saved:"]
@@ -1004,48 +913,21 @@ def perform_save(sender: int, app_data: object) -> None:
         _hide_save_confirm_modal(sender, app_data)
         return
 
-    bypass_crc = False
-    if dpg.does_item_exist("bypass_crc_checkbox"):
-        bypass_crc = bool(dpg.get_value("bypass_crc_checkbox"))
-    bypass_crc_mode = _selected_bypass_mode()
-    force_crc_bypass = bool(dpg.get_value("force_crc_bypass_checkbox")) if dpg.does_item_exist("force_crc_bypass_checkbox") else False
-
     new_text = state.manager.rebuild_text(state.blocks)
     try:
-        state.manager.save(
-            state.manager.path,
-            new_text,
-            bypass_crc=bypass_crc,
-            bypass_crc_mode=bypass_crc_mode,
-            force_crc_bypass=force_crc_bypass,
-        )
+        state.manager.save(state.manager.path, new_text)
     except (OSError, ValueError) as exc:
         append_log(f"Unable to save changes: {exc}")
         _hide_save_confirm_modal(sender, app_data)
         return
 
     append_log(f"Changes saved to '{state.manager.path}'. Backup created with .bak extension.")
-    if bypass_crc:
-        append_log(
-            f"CRC bypass active ({bypass_crc_mode}): saved without restoring the original checksum."
-        )
     state.original_blocks = list(state.blocks)
     state.modified_indices.clear()
     if dpg.does_item_exist("search_input"):
         update_question_list(dpg.get_value("search_input") or "")
     append_log("Cleared change markers; on-disk file now matches the UI.")
     _hide_save_confirm_modal(sender, app_data)
-
-
-def on_force_crc_cancel(sender: int, app_data: object) -> None:
-    if dpg.does_item_exist("force_crc_bypass_checkbox"):
-        dpg.set_value("force_crc_bypass_checkbox", False)
-    dpg.configure_item("force_crc_modal", show=False)
-
-
-def on_force_crc_confirm(sender: int, app_data: object) -> None:
-    dpg.configure_item("force_crc_modal", show=False)
-    append_log("Force CRC override confirmed by user. Proceed with extreme caution.")
 
 
 def on_file_selected(file_path: Union[str, Path]) -> None:
@@ -1460,47 +1342,6 @@ def build_ui() -> None:
                         horizontal_scrollbar=True,
                     )
                     dpg.add_separator()
-                    dpg.add_checkbox(
-                        tag="bypass_crc_checkbox",
-                        label="Bypass CRC handling",
-                        default_value=False,
-                        indent=6,
-                        callback=on_toggle_bypass_crc,
-                    )
-                    with dpg.tooltip(parent="bypass_crc_checkbox"):
-                        dpg.add_text("Saves without restoring the original CRC value.")
-                    dpg.add_text(
-                        "Warning: bypassing CRC may render the file incompatible with strict firmware loaders.",
-                        tag="bypass_crc_warning",
-                        color=(255, 180, 120),
-                        indent=10,
-                        wrap=layout["wrap_width"],
-                        show=False,
-                    )
-                    dpg.add_text(
-                        "Unsafe: every bypass mode is blocked when a CRC header is present unless forced.",
-                        tag="unsafe_crc_warning",
-                        color=(255, 150, 150),
-                        indent=12,
-                        wrap=layout["wrap_width"],
-                        show=False,
-                    )
-                    dpg.add_radio_button(
-                        tag="bypass_crc_mode_selector",
-                        items=list(BYPASS_MODE_LABELS.keys()),
-                        default_value="Empty CRC value (unsafe)",
-                        indent=12,
-                        horizontal=True,
-                        callback=on_crc_mode_change,
-                    )
-                    dpg.configure_item("bypass_crc_mode_selector", enabled=False)
-                    dpg.add_checkbox(
-                        tag="force_crc_bypass_checkbox",
-                        label="Force unsafe CRC change (expert only)",
-                        indent=12,
-                        show=False,
-                        callback=on_force_crc_toggle,
-                    )
                     dpg.add_button(label="Save changes", callback=on_save, indent=6)
 
         with dpg.child_window(tag="console_panel", height=layout["console_panel_height"], autosize_x=True, border=True):
@@ -1537,14 +1378,6 @@ def build_ui() -> None:
         dpg.add_text("", tag="load_error_text", wrap=480)
         dpg.add_button(label="Close", callback=lambda sender, app_data: dpg.configure_item("load_error_modal", show=False))
 
-    with dpg.window(tag="force_crc_modal", modal=True, show=False, no_move=True, no_close=True, no_resize=True):
-        dpg.add_text("Confirm Force CRC Override")
-        dpg.add_separator()
-        dpg.add_text("", tag="force_crc_warning_text", wrap=500)
-        with dpg.group(horizontal=True):
-            dpg.add_button(label="Cancel", callback=on_force_crc_cancel)
-            dpg.add_button(label="Proceed anyway", callback=on_force_crc_confirm)
-
     with dpg.window(tag="risk_confirm_modal", modal=True, show=False, no_move=True, no_close=True, no_resize=True):
         dpg.add_text("Confirm risky change", color=(255, 170, 120))
         dpg.add_separator()
@@ -1576,7 +1409,6 @@ def build_ui() -> None:
     dpg.setup_dearpygui()
     dpg.show_viewport()
     update_detail_wraps()
-    _update_crc_warning_state()
     if hasattr(dpg, "set_viewport_resize_callback"):
         dpg.set_viewport_resize_callback(on_viewport_resize)
     dpg.set_primary_window("primary_window", True)

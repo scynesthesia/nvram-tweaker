@@ -80,13 +80,13 @@ python nvram_editor.py nvram.txt "Power Limit" 0x7d --mode value
 - Hex input is automatically converted to decimal; the summary prints the conversion for clarity.
 - `Min =` / `Max =` ranges are enforced when present to prevent out-of-range writes.
 - Use `--dry-run` to preview changes without writing to disk.
-- CRC handling defaults to restoring the original `HIICrc32` header. Every bypass mode (empty, remove, placeholder) writes something other than the original checksum, so all of them are flagged as unsafe and blocked when a CRC marker is detected unless you explicitly force the change.
+- The `HIICrc32` header is never modified. It is a checksum of the BIOS's setup (HII) database, not of the text, so editing settings does not make it stale. SCEWIN uses it to recognise scripts that belong to the running BIOS. Importing is blocked when a script's header differs from your original export (e.g. a script from another BIOS version).
 
 ### What gets written
 
 - A `.bak` file with the original contents is saved next to the edited file before any modifications are written.
 - Line endings are preserved (Windows or Unix) so the file structure remains consistent.
-- HIICrc32 headers are left untouched; if your firmware loader enforces CRC checks you may need to force import the updated file.
+- The `HIICrc32` header and every line you did not edit are written back byte-for-byte; a save is refused if the result would add, remove or merge Setup Questions.
 
 ### GUI smoke test checklist (manual)
 

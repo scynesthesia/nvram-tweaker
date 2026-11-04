@@ -15,7 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from nvram_crc import _contains_crc_marker, recalculate_crc
+from nvram_crc import extract_crc_header, preserve_crc_header
 from nvram_parsing import (
     BLOCK_PATTERN,
     HELP_PATTERN,
@@ -40,9 +40,6 @@ LOGGER = logging.getLogger(__name__)
 
 MMAP_READ_THRESHOLD = 4 * 1024 * 1024
 TOOL_VERSION = "0.0.0-dev"
-# Every bypass mode writes something other than the original checksum, so all of
-# them need an explicit force when the file carries a HIICrc32 header.
-UNSAFE_CRC_BYPASS_MODES = frozenset({"remove", "empty", "placeholder"})
 
 def _read_file_via_mmap(path: Path) -> bytes:
     """
@@ -83,7 +80,6 @@ class NVRAMManager:
         self.blocks: List[QuestionBlock] = []
         self.trailing_text: str = ""
         self.initial_crc: Optional[str] = None
-        self.has_crc_marker: bool = False
         self.line_ending: str = "\n"
         self._backup_via_copy: bool = False
         self._encoding: str = "utf-8"
@@ -117,18 +113,9 @@ class NVRAMManager:
         self.original_text = None if self._backup_via_copy else text
         self.last_saved_text = text
         self.undo_stack.clear()
-        self.initial_crc = self._extract_crc_header(text)
-        self.has_crc_marker = _contains_crc_marker(text)
+        self.initial_crc = extract_crc_header(text)
         self.line_ending = "\r\n" if "\r\n" in text else "\n"
         return self
-
-    @staticmethod
-    def _extract_crc_header(text: str) -> Optional[str]:
-        lines = text.splitlines()
-        first_line = lines[0].strip() if lines else ""
-        if first_line.startswith("HIICrc32"):
-            return first_line
-        return None
 
     def _normalize_newlines(self, content: str) -> str:
         content = content.replace("\r\n", "\n").replace("\r", "\n")
@@ -137,13 +124,14 @@ class NVRAMManager:
         return self.line_ending.join(content.split("\n"))
 
     def update_value(self, block: QuestionBlock, new_value: int) -> QuestionBlock:
-        def replace_match(match: re.Match[str]) -> str:
-            return f"Value = <{new_value}>"
-
         body = block.body
-        if not VALUE_PATTERN.search(body):
+        value_match = VALUE_PATTERN.search(body)
+        if not value_match:
             raise ValueError("Block does not contain a Value line")
-        new_body = VALUE_PATTERN.sub(replace_match, body, count=1)
+        # Replace only the number so the line's spacing and its line ending survive.
+        # (VALUE_PATTERN also matches trailing whitespace, newline included.)
+        start, end = value_match.span("value")
+        new_body = body[:start] + str(new_value) + body[end:]
         new_fields: List[OptionField | ValueField] = []
         for field in block.fields:
             if isinstance(field, ValueField):
@@ -224,25 +212,13 @@ class NVRAMManager:
             filtered = [b for b in filtered if b.token == token]
         return filtered
 
-    def save(
-        self,
-        path: Path,
-        new_content: str,
-        *,
-        bypass_crc: bool = False,
-        bypass_crc_mode: str = "empty",
-        force_crc_bypass: bool = False,
-    ) -> None:
-        if (
-            bypass_crc
-            and not force_crc_bypass
-            and bypass_crc_mode in UNSAFE_CRC_BYPASS_MODES
-            and self.has_crc_marker
-        ):
-            raise ValueError(
-                "Unsafe CRC bypass blocked: refusing to remove, empty or overwrite HIICrc32 with a placeholder "
-                "when a CRC marker is present. Enable force mode to proceed."
-            )
+    def save(self, path: Path, new_content: str) -> None:
+        """Write ``new_content`` to ``path`` after backing up the current file.
+
+        The original ``HIICrc32`` header is always written back verbatim; see
+        :mod:`nvram_crc` for why it is never modified.
+        """
+
         if self.path is None:
             raise ValueError("No file is currently loaded; cannot save changes.")
 
@@ -263,13 +239,7 @@ class NVRAMManager:
         backup_path.write_text(current_disk_text, encoding=self._encoding)
         self.undo_stack.append(current_disk_text)
 
-        updated_content = recalculate_crc(
-            new_content,
-            self.initial_crc,
-            bypass=bypass_crc,
-            bypass_mode=bypass_crc_mode,
-            tool_version=TOOL_VERSION,
-        )
+        updated_content = preserve_crc_header(new_content, self.initial_crc)
         updated_content = self._normalize_newlines(updated_content)
         path.write_text(updated_content, encoding=self._encoding, newline="")
         self.last_saved_text = updated_content
@@ -305,6 +275,12 @@ class NVRAMManager:
             raise ValueError(
                 "Detected divergence after re-parsing the pending changes; save aborted to prevent data loss."
             )
+        # Edits only move '*' or change numbers, so the questions themselves must be unchanged.
+        # A merged or lost line would still round-trip, so compare the question list too.
+        if [b.name for b in reparsed_blocks] != [b.name for b in self.blocks]:
+            raise ValueError(
+                "The pending changes would add, remove or merge Setup Questions; save aborted to prevent data loss."
+            )
 
     def _read_text_from_disk(self, path: Path) -> str:
         try:
@@ -324,8 +300,7 @@ class NVRAMManager:
             self.blocks, self.trailing_text = find_blocks(text)
         except re.error as exc:
             raise ValueError(f"Unable to re-parse content after save/rollback: {exc}") from exc
-        self.initial_crc = self._extract_crc_header(text)
-        self.has_crc_marker = _contains_crc_marker(text)
+        self.initial_crc = extract_crc_header(text)
         self.line_ending = "\r\n" if "\r\n" in text else "\n"
 
 
