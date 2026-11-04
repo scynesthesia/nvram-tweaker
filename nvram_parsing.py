@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from nvram_structures import BlockField, OptionField, QuestionBlock, ValueField
 
@@ -109,11 +109,8 @@ def find_blocks(text: str) -> tuple[List[QuestionBlock], str]:
                 token=cleaned_token,
                 min_value=min_value,
                 max_value=max_value,
-                start=match.start(),
-                end=match.end(),
                 line_number=line_number,
                 pre_separator=pre_separator,
-                post_separator="",
                 setup_line=header_core,
                 line_ending=match.group("header_ending"),
                 leading_whitespace=leading_whitespace,

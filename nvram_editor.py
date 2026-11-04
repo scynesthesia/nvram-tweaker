@@ -8,24 +8,14 @@ from __future__ import annotations
 
 import argparse
 import logging
-import mmap
 import re
-from collections import deque
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, List, Optional
 
 from nvram_crc import extract_crc_header, preserve_crc_header
 from nvram_parsing import (
-    BLOCK_PATTERN,
-    HELP_PATTERN,
-    MAX_PATTERN,
-    MIN_PATTERN,
-    NUMERIC_INPUT_PATTERN,
     OPTION_LINE_PATTERN,
-    SETUP_BOUNDARY_PATTERN,
-    TOKEN_PATTERN,
-    TOKEN_VALIDATION_PATTERN,
     VALUE_PATTERN,
     find_blocks,
     matches_name,
@@ -38,31 +28,13 @@ from nvram_structures import OptionField, QuestionBlock, ValueField
 
 LOGGER = logging.getLogger(__name__)
 
-MMAP_READ_THRESHOLD = 4 * 1024 * 1024
-TOOL_VERSION = "0.0.0-dev"
-
-def _read_file_via_mmap(path: Path) -> bytes:
-    """
-    Read file contents using a memory map to limit peak memory usage for large files.
-    """
-    with path.open("rb") as handle:
-        with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mm_obj:
-            return mm_obj.read()
-
 
 def _decode_bytes(raw_bytes: bytes, path: Path) -> tuple[str, str]:
+    """Decode as UTF-8, falling back to latin-1 (which accepts every byte sequence)."""
+
     try:
         return raw_bytes.decode("utf-8"), "utf-8"
     except UnicodeDecodeError as exc:
-        try:
-            text = raw_bytes.decode("latin-1")
-        except UnicodeDecodeError:
-            preview = raw_bytes[: exc.start].decode("utf-8", errors="ignore")
-            line_number = preview.count("\n") + 1
-            raise ValueError(
-                f"Failed to decode '{path}' as UTF-8 or latin-1 near line {line_number}: {exc.reason}."
-            ) from exc
-
         preview = raw_bytes[: exc.start].decode("utf-8", errors="ignore")
         line_number = preview.count("\n") + 1
         LOGGER.warning(
@@ -70,35 +42,25 @@ def _decode_bytes(raw_bytes: bytes, path: Path) -> tuple[str, str]:
             path,
             line_number,
         )
-        return text, "latin-1"
+        return raw_bytes.decode("latin-1"), "latin-1"
 
 
 class NVRAMManager:
     def __init__(self) -> None:
         self.path: Optional[Path] = None
-        self.original_text: Optional[str] = None
         self.blocks: List[QuestionBlock] = []
         self.trailing_text: str = ""
         self.initial_crc: Optional[str] = None
         self.line_ending: str = "\n"
-        self._backup_via_copy: bool = False
         self._encoding: str = "utf-8"
         self.last_saved_text: Optional[str] = None
-        self.undo_stack: deque[str] = deque(maxlen=5)
 
     def load_file(self, path: Path) -> "NVRAMManager":
         if not path.exists():
             raise ValueError(f"The file '{path}' does not exist. Please provide a valid path.")
 
-        file_size = path.stat().st_size
-        use_mmap = file_size >= MMAP_READ_THRESHOLD
         try:
-            if use_mmap:
-                raw_bytes = _read_file_via_mmap(path)
-                self._backup_via_copy = True
-            else:
-                raw_bytes = path.read_bytes()
-                self._backup_via_copy = False
+            raw_bytes = path.read_bytes()
         except OSError as exc:
             raise ValueError(f"Unable to read '{path}': {exc}") from exc
 
@@ -110,9 +72,7 @@ class NVRAMManager:
             raise ValueError(f"Unable to parse Setup Question blocks: {exc}") from exc
 
         self.path = path
-        self.original_text = None if self._backup_via_copy else text
         self.last_saved_text = text
-        self.undo_stack.clear()
         self.initial_crc = extract_crc_header(text)
         self.line_ending = "\r\n" if "\r\n" in text else "\n"
         return self
@@ -237,25 +197,12 @@ class NVRAMManager:
 
         backup_path = path.with_name(path.name + ".bak")
         backup_path.write_text(current_disk_text, encoding=self._encoding)
-        self.undo_stack.append(current_disk_text)
 
         updated_content = preserve_crc_header(new_content, self.initial_crc)
         updated_content = self._normalize_newlines(updated_content)
         path.write_text(updated_content, encoding=self._encoding, newline="")
         self.last_saved_text = updated_content
         self._refresh_state_from_text(updated_content)
-
-    def rollback_last_save(self) -> None:
-        if self.path is None:
-            raise ValueError("No file is currently loaded; cannot roll back.")
-
-        if not self.undo_stack:
-            raise ValueError("No prior save is available to roll back to.")
-
-        previous_content = self.undo_stack.pop()
-        self.path.write_text(previous_content, encoding=self._encoding, newline="")
-        self.last_saved_text = previous_content
-        self._refresh_state_from_text(previous_content)
 
     def rebuild_text(self, blocks: Optional[List[QuestionBlock]] = None) -> str:
         """Round-trip blocks back to text while preserving formatting.
@@ -287,10 +234,11 @@ class NVRAMManager:
             with path.open("r", encoding=self._encoding, newline="") as handle:
                 return handle.read()
         except UnicodeDecodeError:
+            # The file changed to something that is no longer valid in our encoding; latin-1 reads any bytes.
             try:
                 with path.open("r", encoding="latin-1", newline="") as handle:
                     return handle.read()
-            except (UnicodeDecodeError, OSError) as exc:
+            except OSError as exc:
                 raise ValueError(str(exc)) from exc
         except OSError as exc:
             raise ValueError(str(exc)) from exc
@@ -299,25 +247,9 @@ class NVRAMManager:
         try:
             self.blocks, self.trailing_text = find_blocks(text)
         except re.error as exc:
-            raise ValueError(f"Unable to re-parse content after save/rollback: {exc}") from exc
+            raise ValueError(f"Unable to re-parse content after save: {exc}") from exc
         self.initial_crc = extract_crc_header(text)
         self.line_ending = "\r\n" if "\r\n" in text else "\n"
-
-
-def matches_name(block: QuestionBlock, query: str, exact: bool) -> bool:
-    if exact:
-        return block.name == query
-    return query.lower() in block.name.lower()
-
-
-def selected_option(body: str) -> Optional[str]:
-    for line in body.splitlines():
-        opt_match = OPTION_LINE_PATTERN.match(line)
-        if opt_match and opt_match.group("star"):
-            code = opt_match.group("code")
-            label = opt_match.group("label").rstrip()
-            return f"*[{code}]{label}"
-    return None
 
 
 def describe_block(block: QuestionBlock) -> str:
@@ -412,13 +344,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _validate_value_arg(raw_value: str) -> tuple[int, Optional[str]]:
-    try:
-        return validate_numeric_input(raw_value)
-    except ValueError as exc:
-        raise ValueError(str(exc))
-
-
 def main() -> int:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -468,11 +393,7 @@ def main() -> int:
         value_conversion_note: Optional[str] = None
 
         if args.mode == "value":
-            raw_value = args.value.strip()
-            try:
-                new_value, value_conversion_note = _validate_value_arg(raw_value)
-            except ValueError as exc:
-                raise ValueError(str(exc)) from exc
+            new_value, value_conversion_note = validate_numeric_input(args.value.strip())
         else:
             new_value = None
 

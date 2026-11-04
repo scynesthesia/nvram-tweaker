@@ -51,6 +51,9 @@ RISK_KEYWORDS: Tuple[str, ...] = (
     "Watchdog",
 )
 
+# SCEWIN appends a '// Move "*" to the desired Option' hint to option lines.
+_INLINE_COMMENT = re.compile(r"\s//")
+
 _RISK_PATTERNS = tuple(
     (keyword, re.compile(rf"(?<![A-Za-z0-9]){re.escape(keyword)}(?![A-Za-z])", re.IGNORECASE))
     for keyword in RISK_KEYWORDS
@@ -82,7 +85,8 @@ def current_setting(block: QuestionBlock) -> Optional[str]:
             return f"Value <{field.value}>"
     for field in block.fields:
         if isinstance(field, OptionField) and field.selected:
-            return f"[{field.code}]{field.label.strip()}"
+            label = _INLINE_COMMENT.split(field.label, maxsplit=1)[0].strip() or field.label.strip()
+            return f"[{field.code}]{label}"
     return None
 
 

@@ -16,9 +16,6 @@ class ValueField:
     value: int
     line_ending: str = "\n"
 
-    def render(self) -> str:
-        return f"Value = <{self.value}>{self.line_ending}"
-
 
 @dataclass(frozen=True)
 class OptionField:
@@ -29,10 +26,6 @@ class OptionField:
     label: str
     selected: bool
     line_ending: str = "\n"
-
-    def render(self) -> str:
-        marker = "*" if self.selected else ""
-        return f"{self.prefix}{marker}[{self.code}]{self.label}{self.line_ending}"
 
     def toggle(self, make_selected: bool) -> "OptionField":
         return replace(self, selected=make_selected)
@@ -51,11 +44,8 @@ class QuestionBlock:
     token: str | None
     min_value: int | None
     max_value: int | None
-    start: int
-    end: int
     line_number: int
     pre_separator: str
-    post_separator: str
     setup_line: str
     line_ending: str
     leading_whitespace: str

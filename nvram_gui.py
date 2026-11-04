@@ -17,7 +17,7 @@ from nvram_editor import (
     validate_numeric_input,
     apply_changes,
 )
-from nvram_safety import find_risky_blocks
+from nvram_safety import current_setting, find_risky_blocks
 from scewin_runner import (
     DEFAULT_SCRIPT_NAME,
     SCEWINError,
@@ -72,7 +72,6 @@ class PendingChange:
     option_display: Optional[str] = None
     new_value: Optional[int] = None
     conversion_note: Optional[str] = None
-    is_batch: bool = False
 
 
 @dataclass
@@ -95,16 +94,6 @@ class GUIState:
     scewin_runner: Optional[SCEWINRunner] = None
     pending_scewin_action: Optional[str] = None
     pending_scewin_path: Optional[Path] = None
-
-    def reset(self) -> None:
-        self.blocks = []
-        self.original_blocks = []
-        self.label_to_index = {}
-        self.selected_index = None
-        self.selected_indices = []
-        self.log_messages = []
-        self.pending_change = None
-        self.modified_indices = set()
 
 
 state = GUIState()
@@ -140,26 +129,10 @@ def extract_options(body: str) -> List[OptionEntry]:
     return options
 
 
-def _selected_option_display(body: str) -> Optional[str]:
-    for line in body.splitlines():
-        opt_match = OPTION_LINE_PATTERN.match(line)
-        if opt_match and opt_match.group("star"):
-            code = opt_match.group("code")
-            label = INLINE_COMMENT_PATTERN.split(opt_match.group("label"), maxsplit=1)[0].strip()
-            return f"*[{code}]{label}"
-    return None
-
-
 def _describe_block_setting(block: Optional[QuestionBlock]) -> str:
     if block is None:
         return "<unknown>"
-    value_match = VALUE_PATTERN.search(block.body)
-    if value_match:
-        return f"Value <{value_match.group('value')}>"
-    option = _selected_option_display(block.body)
-    if option:
-        return f"Selected {option}"
-    return "No selection"
+    return current_setting(block) or "No selection"
 
 
 def set_detail_header(block: QuestionBlock) -> None:
@@ -691,7 +664,6 @@ def on_batch_option_apply(sender: int, app_data: object, user_data: Optional[Dic
         action="option",
         option_match_value=str(option_label).strip(),
         option_display=str(option_label).strip(),
-        is_batch=True,
     )
     handle_change_request(pending)
 
@@ -763,7 +735,6 @@ def on_batch_value_apply(sender: int, app_data: object, user_data: Optional[Dict
         action="value",
         new_value=parsed_value,
         conversion_note=conversion_note,
-        is_batch=True,
     )
     handle_change_request(pending)
 
@@ -958,20 +929,15 @@ def on_file_selected(file_path: Union[str, Path]) -> None:
     if dpg.does_item_exist("search_input"):
         dpg.set_value("search_input", "")
     block_count = len(state.blocks)
-    label_text = f"Loaded: {resolved_path.name} ({block_count} blocks)"
-    if block_count == 0:
-        label_text = f"Loaded: {resolved_path.name} (no questions detected)"
-    dpg.set_value("loaded_file_label", label_text)
-    block_count = len(state.blocks)
-    append_log(f"Successfully loaded {block_count} block(s).")
-    append_log(f"Scan complete: found {block_count} total blocks.")
-    append_log(f"Load complete. Total blocks: {block_count}")
     if block_count:
-        append_log(f"Validated file: {block_count} configuration blocks found.")
-        append_log(f"Loaded file: {resolved_path}")
+        dpg.set_value("loaded_file_label", f"Loaded: {resolved_path.name} ({block_count} blocks)")
+        append_log(f"Loaded {resolved_path}: {block_count} question(s).")
     else:
-        append_log("ERROR: No Setup Question blocks detected. Verify the file format.")
-        append_log("CRITICAL: No Setup Question blocks detected. Confirm this is a valid AMISCE export.")
+        dpg.set_value("loaded_file_label", f"Loaded: {resolved_path.name} (no questions detected)")
+        append_log(
+            f"ERROR: No Setup Question blocks detected in {resolved_path}. "
+            "Confirm this is a valid AMISCE export."
+        )
     update_question_list("")
     if state.blocks:
         first_index = 0
@@ -981,8 +947,6 @@ def on_file_selected(file_path: Union[str, Path]) -> None:
         if dpg.does_item_exist(selectable_tag):
             dpg.set_value(selectable_tag, True)
         on_question_selected(None, None, {"index": first_index, "tag": selectable_tag})
-    else:
-        dpg.set_value("loaded_file_label", f"Loaded: {resolved_path.name} (no questions detected)")
 
 
 def _dialog_start_path() -> str:

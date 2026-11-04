@@ -138,7 +138,7 @@ def test_diff_texts_flags_risky_changes() -> None:
     change = changes[0]
     assert change.name == "XHCI Hand-off"
     assert change.before == "[01]Enabled"
-    assert change.after.startswith("[00]Disabled")
+    assert change.after == "[00]Disabled"
     assert change.risk_keywords == ("XHCI",)
 
 
@@ -235,6 +235,30 @@ def test_cli_diagnose_explains_a_log(tmp_path: Path, capsys) -> None:
     log.write_text("WARNING: HII data does not have setup questions information\n", encoding="utf-8")
     assert scewin_runner.main(["diagnose", str(log)]) == 1
     assert "Publish HII Resources" in capsys.readouterr().out
+
+
+def test_current_setting_drops_scewin_hint_comment() -> None:
+    blocks, _ = nvram_safety.find_blocks(SAMPLE_EXPORT)
+    by_name = {block.name: block for block in blocks}
+    assert nvram_safety.current_setting(by_name["Above 4G Decoding"]) == "[00]Disabled"
+    assert nvram_safety.current_setting(by_name["XHCI Hand-off"]) == "[01]Enabled"
+    assert nvram_safety.current_setting(by_name["Fan Start Temperature"]) == "Value <30>"
+
+
+def test_non_utf8_file_loads_and_saves_with_latin1(tmp_path: Path) -> None:
+    raw = SAMPLE_EXPORT.replace("Enables or Disables", "Enables o\xe9 Disables").encode("latin-1")
+    path = tmp_path / "nvram.txt"
+    path.write_bytes(raw)
+
+    manager = nvram_editor.NVRAMManager().load_file(path)
+    assert manager._encoding == "latin-1"
+    blocks = list(manager.blocks)
+    blocks[2] = manager.update_value(blocks[2], 45)
+    manager.save(path, manager.rebuild_text(blocks))
+
+    # Only the "Value" line changes; the "BIOS Default" line above it keeps <30>.
+    head, _, tail = raw.rpartition(b"<30>")
+    assert path.read_bytes() == head + b"<45>" + tail
 
 
 # --- value edits -----------------------------------------------------------
