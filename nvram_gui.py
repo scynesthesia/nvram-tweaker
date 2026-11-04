@@ -248,13 +248,15 @@ def get_filtered_indices(filter_text: str) -> List[int]:
         collapsed = text.replace("-", " ").replace("_", " ").lower()
         return " ".join(collapsed.split())
 
+    # Commented-out questions are inactive variants, not settings: never list them.
+    active_indices = [idx for idx, block in enumerate(state.blocks) if not block.is_commented]
     normalized_filter = _normalize(filter_text)
     if not normalized_filter:
-        return list(range(len(state.blocks)))
+        return active_indices
 
     words = normalized_filter.split()
     normalized_names = [_normalize(block.name) for block in state.blocks]
-    matching_indices: Set[int] = set(range(len(state.blocks)))
+    matching_indices: Set[int] = set(active_indices)
 
     for word in words:
         word_matches = {idx for idx, name in enumerate(normalized_names) if word in name}
@@ -683,11 +685,9 @@ def parse_numeric_input(block: QuestionBlock, raw_value: Union[str, int]) -> Tup
         except ValueError as exc:
             return None, str(exc)
 
-    if block.min_value is not None and parsed_value < block.min_value:
-        return None, _range_error_message(block.min_value, block.max_value)
-
-    if block.max_value is not None and parsed_value > block.max_value:
-        return None, _range_error_message(block.min_value, block.max_value)
+    low, high = block.value_bounds()
+    if (low is not None and parsed_value < low) or (high is not None and parsed_value > high):
+        return None, _range_error_message(low, high)
 
     return parsed_value, conversion_note
 
@@ -740,7 +740,7 @@ def on_batch_value_apply(sender: int, app_data: object, user_data: Optional[Dict
 
 
 def _range_error_message(min_value: Optional[int], max_value: Optional[int]) -> str:
-    return f"Value out of range (Min: {min_value}, Max: {max_value})"
+    return f"Value out of range (allowed {min_value} to {max_value})"
 
 
 def handle_change_request(change: "PendingChange") -> None:

@@ -15,6 +15,7 @@ checks too (skipped otherwise, including in CI).
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -130,6 +131,12 @@ def test_full_export_round_trips_and_saves_byte_identically(tmp_path: Path) -> N
     manager = nvram_editor.NVRAMManager().load_file(copy)
     assert len(manager.blocks) > 100
     assert nvram_safety.preflight_issues(original.decode("latin-1")) == []
+
+    # Every parsed name must equal the raw text of its header line (no truncation).
+    raw_names = re.findall(
+        r"(?m)^[ \t]*(?://[ \t]*)?Setup Question[ \t]*=[ \t]*(.*?)\r?$", original.decode("latin-1")
+    )
+    assert [b.name for b in manager.blocks] == [name.strip() for name in raw_names]
 
     manager.save(copy, manager.rebuild_text())
 

@@ -96,12 +96,13 @@ class NVRAMManager:
         return self
 
     def update_value(self, block: QuestionBlock, new_value: int) -> QuestionBlock:
+        _require_editable(block)
         body = block.body
         value_match = VALUE_PATTERN.search(body)
         if not value_match:
             raise ValueError("Block does not contain a Value line")
-        # Replace only the number so the line's spacing and its line ending survive.
-        # (VALUE_PATTERN also matches trailing whitespace, newline included.)
+        # Replace only the number, so the form (``<30>`` or bare ``30``), the spacing
+        # and the line ending all survive.
         start, end = value_match.span("value")
         new_body = body[:start] + str(new_value) + body[end:]
         new_fields: List[OptionField | ValueField] = []
@@ -113,6 +114,8 @@ class NVRAMManager:
         return block.with_body(new_body).with_fields(new_fields)
 
     def update_options(self, block: QuestionBlock, option_label: str) -> QuestionBlock:
+        _require_editable(block)
+
         def _normalize(text: str) -> str:
             return re.sub(r"\s+", "", text).lower()
 
@@ -180,7 +183,7 @@ class NVRAMManager:
         return block.with_body("".join(new_lines)).with_fields(new_fields)
 
     def filter_blocks(self, query: str, exact: bool, token: Optional[str]) -> List[QuestionBlock]:
-        filtered = [b for b in self.blocks if matches_name(b, query, exact)]
+        filtered = [b for b in self.blocks if not b.is_commented and matches_name(b, query, exact)]
         if token is not None:
             filtered = [b for b in filtered if b.token == token]
         return filtered
@@ -291,11 +294,27 @@ def format_help_text(help_string: Optional[str]) -> str:
     return help_text
 
 
+def _require_editable(block: QuestionBlock) -> None:
+    if block.is_commented:
+        raise ValueError(
+            f"'{block.name}' is commented out in the export (inactive on this system), so it cannot be edited."
+        )
+
+
 def _validate_value_range(block: QuestionBlock, new_value: int) -> None:
-    if block.min_value is not None and new_value < block.min_value:
-        raise ValueError(f"Value {new_value} is below Min {block.min_value}.")
-    if block.max_value is not None and new_value > block.max_value:
-        raise ValueError(f"Value {new_value} is above Max {block.max_value}.")
+    """Reject values the question cannot hold: explicit Min/Max, else its byte Width."""
+
+    low, high = block.value_bounds()
+    if low is not None and new_value < low:
+        if block.min_value is not None:
+            raise ValueError(f"Value {new_value} is below Min {low}.")
+        raise ValueError(f"Value {new_value} is below {low}; this setting cannot be negative.")
+    if high is not None and new_value > high:
+        if block.max_value is not None:
+            raise ValueError(f"Value {new_value} is above Max {high}.")
+        raise ValueError(
+            f"Value {new_value} is above {high}, the largest a {block.width}-byte setting can hold."
+        )
 
 
 def apply_changes(

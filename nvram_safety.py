@@ -71,6 +71,8 @@ def find_risky_blocks(blocks: Iterable[QuestionBlock]) -> List[Tuple[QuestionBlo
 
     risky: List[Tuple[QuestionBlock, List[str]]] = []
     for block in blocks:
+        if block.is_commented:
+            continue
         keywords = risky_keywords(block.name)
         if keywords:
             risky.append((block, keywords))
@@ -108,6 +110,8 @@ def _keyed(blocks: Iterable[QuestionBlock]) -> Dict[Tuple[str, Optional[str], in
     seen: Counter[Tuple[str, Optional[str]]] = Counter()
     keyed: Dict[Tuple[str, Optional[str], int], QuestionBlock] = {}
     for block in blocks:
+        if block.is_commented:  # inactive variants are not settings
+            continue
         base = (block.name, block.token)
         keyed[(block.name, block.token, seen[base])] = block
         seen[base] += 1
@@ -164,13 +168,15 @@ def preflight_issues(text: str) -> List[str]:
 
     issues: List[str] = []
     blocks, trailing = find_blocks(text)
-    if not blocks:
-        return ["No 'Setup Question' blocks were found; this does not look like a SCEWIN export."]
+    if not any(not block.is_commented for block in blocks):
+        return ["No active 'Setup Question' blocks were found; this does not look like a SCEWIN export."]
 
     if rebuild_text(blocks, trailing_text=trailing) != text:
         issues.append("The file does not round-trip through the parser; refusing to import it.")
 
     for block in blocks:
+        if block.is_commented:
+            continue
         options = [field for field in block.fields if isinstance(field, OptionField)]
         if not options:
             continue
