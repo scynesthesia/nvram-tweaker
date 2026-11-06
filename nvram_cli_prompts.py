@@ -6,11 +6,15 @@ to a BIOS or a file by accident:
 * ``--yes`` answers the plain "apply these changes?" question;
 * ``--allow-risky`` is a separate flag for changes that can lock a board or harm
   hardware (see :mod:`nvram_safety`). ``--yes`` alone never covers them.
+* Expert mode (:mod:`nvram_settings`) skips the typed YES for a person at a terminal;
+  it does not apply to scripts and does not answer the final Y/N.
 """
 from __future__ import annotations
 
 import sys
 from typing import Callable, Optional, Sequence
+
+import nvram_settings
 
 
 def is_interactive() -> bool:
@@ -48,7 +52,11 @@ def confirm_write(
         say("These changes touch settings that can lock the board or harm hardware:")
         for line in risky_lines:
             say(f"  - {line}")
-        if not allow_risky:
+        # Expert mode only replaces the typed YES of a person at a terminal. A script still has
+        # to pass --allow-risky, so a stored setting never widens what an unattended run may write.
+        if interactive and not allow_risky and nvram_settings.expert_mode():
+            say("Expert mode is on: not asking to confirm these.")
+        elif not allow_risky:
             if not interactive:
                 say("Refusing: pass --allow-risky to confirm risky changes when not running interactively.")
                 return False

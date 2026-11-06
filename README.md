@@ -76,6 +76,29 @@ python nvram_tweaker_cli.py set  nvram.txt "XHCI" "Enabled" --yes --allow-risky
 
 `nvram_editor.py FILE QUERY VALUE --mode option|value` (the original command) still works and forwards to `set`.
 
+### Expert mode
+
+If you know what you are doing and the confirm-level prompts only slow you down, turn them off. It is **off by default** and needs an acknowledgement ("this can brick my machine and I know how to clear CMOS").
+
+```bash
+python nvram_tweaker_cli.py config set expert true     # asks you to type: I UNDERSTAND
+python nvram_tweaker_cli.py config set expert true --i-understand   # same, without the question
+python nvram_tweaker_cli.py config set expert false
+python nvram_tweaker_cli.py config show                # state and settings file location
+```
+
+In the GUI it is the *Expert mode (skip risk prompts)* checkbox in the sidebar; the window title shows `[EXPERT MODE]` while it is on, and the CLI prints a one-line banner on `set`, `import` and `restore`.
+
+| Expert mode removes | Expert mode keeps |
+|---|---|
+| the CLI's typed `YES` for confirm-level settings | the change list with its `[RISK: ...]` tags |
+| the GUI's risk dialog when you pick a risky option | the integrity checks: one `*` per option, same `HIICrc32`, no missing questions, no edits outside the selected option or a number |
+| the GUI's "I understand" tick box before an import | the snapshot of the live BIOS before an import (your undo) |
+| | the final "write these changes now?" question |
+| | `--allow-risky` for scripts: a stored setting never widens what an unattended run may write |
+
+The setting lives in `settings.json` (`%APPDATA%\nvram-tweaker\` on Windows, `~/.config/nvram-tweaker/` elsewhere; override with the `NVRAM_TWEAKER_CONFIG` environment variable).
+
 ## Reading and writing the BIOS with SCEWIN
 
 NVRAM Tweaker can drive AMI's SCEWIN to get the file from your machine and write your edits back. It does **not** ship SCEWIN. Get the `SCEWIN` folder (`SCEWIN_64.exe`, `amifldrv64.sys`, `amigendrv64.sys`) with [SCEHUB](https://github.com/ab3lkaizen/SCEHUB)'s `DL_SCEWIN.exe`, which extracts it from MSI Center. SCEWIN only works on Windows with an AMI BIOS and must run as administrator, so start NVRAM Tweaker as administrator.

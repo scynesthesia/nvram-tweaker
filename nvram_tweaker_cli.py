@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
+import nvram_settings
 import scewin_runner
 from nvram_cli_prompts import confirm_write, is_interactive
 from nvram_editor import NVRAMManager, apply_changes, restore_point_path
@@ -266,6 +267,36 @@ def cmd_set(
     return EXIT_OK
 
 
+# --- config -----------------------------------------------------------------------
+
+
+def cmd_config(args: argparse.Namespace, *, interactive: Optional[bool], ask: Callable[[str], str]) -> int:
+    if args.config_command == "show":
+        state = "on" if nvram_settings.expert_mode() else "off"
+        print(f"expert mode: {state}")
+        print(f"settings file: {nvram_settings.settings_path()}")
+        return EXIT_OK
+
+    if args.value == "false":
+        nvram_settings.set_expert_mode(False)
+        print("Expert mode is off.")
+        return EXIT_OK
+
+    if not args.i_understand:
+        if interactive is None:
+            interactive = is_interactive()
+        if not interactive:
+            _error("Turning expert mode on needs your acknowledgement: pass --i-understand.")
+            return EXIT_ERROR
+        print(nvram_settings.ACKNOWLEDGEMENT, file=sys.stderr)
+        if ask("Type I UNDERSTAND to turn expert mode on: ").strip().lower() != "i understand":
+            print("Cancelled; expert mode stays off.", file=sys.stderr)
+            return EXIT_ERROR
+    nvram_settings.set_expert_mode(True, acknowledged=True)
+    print("Expert mode is on. Interactive runs no longer ask to confirm risky settings; scripts still need --allow-risky.")
+    return EXIT_OK
+
+
 # --- entry point ------------------------------------------------------------------
 
 
@@ -313,6 +344,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-risky", action="store_true", help="confirm changes to risky settings without asking (scripts)"
     )
 
+    config_parser = sub.add_parser("config", help="show or change settings (expert mode)")
+    config_sub = config_parser.add_subparsers(dest="config_command", required=True, metavar="ACTION")
+    config_sub.add_parser("show", help="print the current settings and where they are stored")
+    config_set = config_sub.add_parser("set", help="change a setting")
+    config_set.add_argument("key", choices=["expert"], help="expert: skip the extra confirmation for risky settings")
+    config_set.add_argument("value", choices=["true", "false"])
+    config_set.add_argument(
+        "--i-understand",
+        action="store_true",
+        help="acknowledge the risk without being asked (needed to turn expert mode on from a script)",
+    )
+
     scewin_runner.add_subcommands(sub)
     return parser
 
@@ -324,7 +367,11 @@ def main(
     ask: Callable[[str], str] = input,
 ) -> int:
     args = build_parser().parse_args(argv)
+    if args.command in ("set", "import", "restore") and nvram_settings.expert_mode():
+        print("[expert mode is on: risky settings are not asked about; 'config set expert false' turns it off]", file=sys.stderr)
     try:
+        if args.command == "config":
+            return cmd_config(args, interactive=interactive, ask=ask)
         if args.command == "list":
             return cmd_list(args)
         if args.command == "show":
