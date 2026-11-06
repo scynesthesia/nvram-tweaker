@@ -14,7 +14,7 @@ import nvram_editor
 import nvram_tweaker_cli as cli
 import scewin_runner
 from nvram_version import __version__
-from test_scewin_integration import FakeRun
+from test_scewin_integration import SAMPLE_EXPORT, FakeRun
 
 FIXTURE = Path(__file__).parent / "tests" / "fixtures" / "real_export_trimmed.txt"
 
@@ -326,7 +326,9 @@ def test_export_set_import_restore_through_the_cli(fake_scewin, tmp_path, capsys
 
     calls = len(fake.calls)
     code, _, err = run_cli(capsys, "import", "--scewin", scewin_dir, "--file", script, "--yes")
-    assert code == 1 and "--allow-risky" in err and len(fake.calls) == calls
+    assert code == 1 and "--allow-risky" in err
+    # Reading the live BIOS (/o) is fine; nothing may have been written (/i).
+    assert all("/i" not in call for call in fake.calls[calls:])
 
     code, out, _ = run_cli(capsys, "import", "--scewin", scewin_dir, "--file", script, "--yes", "--allow-risky")
     assert code == 0 and "XHCI Hand-off" in out
@@ -352,3 +354,38 @@ def test_a_filesystem_error_is_reported_not_raised(export, capsys, monkeypatch) 
     code, _, err = run_cli(capsys, "set", export, "Adjust VID", "300", "--yes")
     assert code == 1 and "access is denied" in err
     assert export.read_bytes() == before
+
+
+def test_import_without_a_restore_point_reads_the_live_bios_first(fake_scewin, tmp_path, capsys) -> None:
+    scewin_dir, fake = fake_scewin
+    script = tmp_path / "nvram.txt"
+    script.write_text(SAMPLE_EXPORT.replace("Value\t=<30>", "Value\t=<45>"), encoding="utf-8")  # no restore point yet
+
+    code, out, _ = run_cli(capsys, "import", "--scewin", scewin_dir, "--file", script, "--yes")
+
+    assert code == 0 and "Fan Start Temperature" in out and "nvram.preimport.txt" in out
+    assert fake.calls[0][1] == "/o" and fake.calls[-1][1] == "/i"  # read first, then write
+    assert (tmp_path / "nvram.original.txt").is_file()  # the snapshot became the restore point
+
+
+def test_import_without_a_baseline_is_refused_with_no_snapshot(fake_scewin, tmp_path, capsys) -> None:
+    scewin_dir, fake = fake_scewin
+    script = tmp_path / "nvram.txt"
+    script.write_text(SAMPLE_EXPORT, encoding="utf-8")
+
+    code, _, err = run_cli(capsys, "import", "--scewin", scewin_dir, "--file", script, "--yes", "--no-snapshot")
+
+    assert code == 1 and "nothing to compare" in err
+    assert fake.calls == []
+
+
+def test_import_with_an_edited_offset_is_refused_even_with_yes(fake_scewin, tmp_path, capsys) -> None:
+    scewin_dir, fake = fake_scewin
+    script = tmp_path / "nvram.txt"
+    run_cli(capsys, "export", "--scewin", scewin_dir, "--file", script)
+    script.write_text(script.read_text(encoding="utf-8").replace("Offset\t=12", "Offset\t=FF"), encoding="utf-8")
+
+    code, _, err = run_cli(capsys, "import", "--scewin", scewin_dir, "--file", script, "--yes", "--allow-risky")
+
+    assert code == 1 and "differ in more than the selected option" in err
+    assert all(call[1] != "/i" for call in fake.calls)

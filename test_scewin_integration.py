@@ -258,9 +258,9 @@ def test_import_is_blocked_by_preflight(tmp_path: Path, scewin_dir: Path) -> Non
 def test_import_runs_scewin_and_reports_errors(tmp_path: Path, scewin_dir: Path) -> None:
     run = FakeRun(output="Warning: Error in writing variable Setup to NVRAM\n")
     script = tmp_path / "nvram.txt"
-    script.write_text(SAMPLE_EXPORT, encoding="utf-8")
+    make_runner(scewin_dir, FakeRun()).export(script)  # gives the import a restore point to compare against
     result = make_runner(scewin_dir, run).import_script(script)
-    assert run.calls[0][1:] == ["/i", "/s", str(script.resolve())]
+    assert run.calls[-1][1:] == ["/i", "/s", str(script.resolve())]
     assert not result.ok
     assert [d.key for d in result.diagnoses] == ["write_protected"]
 
@@ -377,3 +377,125 @@ def test_edit_and_save_keep_exported_header(tmp_path: Path) -> None:
     saved = path.read_text(encoding="utf-8")
     assert saved.splitlines()[0] == "HIICrc32= 5B2C3F1A"
     assert nvram_safety.preflight_issues(saved) == []
+
+
+# --- audit fixes: baseline for every import, invisible edits, export backup -----------
+
+
+class LiveBiosRun(FakeRun):
+    """Like FakeRun, but 'exports' whatever the live BIOS currently holds."""
+
+    def __init__(self, live_text: str) -> None:
+        super().__init__()
+        self.live_text = live_text
+
+    def __call__(self, command, **kwargs):
+        self.calls.append(list(command))
+        self.kwargs.append(kwargs)
+        if "/o" in command:
+            Path(command[-1]).write_text(self.live_text, encoding="utf-8")
+        return subprocess.CompletedProcess(command, self.returncode, stdout=self.output, stderr="")
+
+
+def _xhci_disabled(text: str) -> str:
+    return text.replace(
+        '[00]Disabled\t// Move "*" to the desired Option\n         *[01]Enabled',
+        '*[00]Disabled\t// Move "*" to the desired Option\n         [01]Enabled',
+    )
+
+
+def test_import_is_refused_without_any_baseline(tmp_path: Path, scewin_dir: Path) -> None:
+    run = FakeRun()
+    script = tmp_path / "nvram.txt"
+    script.write_text(_xhci_disabled(SAMPLE_EXPORT), encoding="utf-8")  # a risky edit, no restore point
+    runner = make_runner(scewin_dir, run)
+
+    assert any("nothing to compare" in issue for issue in runner.check_import(script))
+    assert runner.changes_since_export(script) is None
+    with pytest.raises(scewin_runner.SCEWINError, match="nothing to compare"):
+        runner.import_script(script)
+    assert all("/i" not in call for call in run.calls)
+
+
+def test_snapshot_reads_the_live_bios_and_seeds_the_restore_point(tmp_path: Path, scewin_dir: Path) -> None:
+    run = FakeRun()
+    script = tmp_path / "nvram.txt"
+    baseline = make_runner(scewin_dir, run).snapshot(script)
+
+    assert baseline == (tmp_path / "nvram.preimport.txt").resolve()
+    assert baseline.read_text(encoding="utf-8") == SAMPLE_EXPORT
+    assert (tmp_path / "nvram.original.txt").read_text(encoding="utf-8") == SAMPLE_EXPORT
+    assert run.calls[-1][1] == "/o"  # read-only: never /i
+
+
+def test_failed_snapshot_blocks_the_import(tmp_path: Path, scewin_dir: Path) -> None:
+    run = FakeRun(output="LoadDeviceDriver returned false\n", returncode=1)
+    with pytest.raises(scewin_runner.SCEWINError, match="Could not read the current BIOS"):
+        make_runner(scewin_dir, run).snapshot(tmp_path / "nvram.txt")
+
+
+def test_changes_are_listed_against_the_live_bios_not_a_stale_restore_point(tmp_path: Path, scewin_dir: Path) -> None:
+    script = tmp_path / "nvram.txt"
+    make_runner(scewin_dir, FakeRun()).export(script)  # restore point: Fan Start 30
+    live = SAMPLE_EXPORT.replace("<30>", "<50>")  # changed in the BIOS setup screen since
+    runner = make_runner(scewin_dir, LiveBiosRun(live))
+    baseline = runner.snapshot(script)
+    script.write_text(live.replace("<50>", "<55>"), encoding="utf-8")
+
+    changes = runner.changes_since_export(script, baseline)
+    assert [(c.name, c.before, c.after) for c in changes] == [("Fan Start Temperature", "Value <50>", "Value <55>")]
+
+
+def test_import_is_blocked_when_a_line_other_than_the_setting_was_edited(tmp_path: Path, scewin_dir: Path) -> None:
+    run = FakeRun()
+    runner = make_runner(scewin_dir, run)
+    script = tmp_path / "nvram.txt"
+    runner.export(script)
+    script.write_text(SAMPLE_EXPORT.replace("Offset\t=12", "Offset\t=FF"), encoding="utf-8")
+
+    assert runner.changes_since_export(script) == []  # the old blind spot: no visible change
+    with pytest.raises(scewin_runner.SCEWINError, match=r"differ in more than the selected option"):
+        runner.import_script(script)
+    assert all("/i" not in call for call in run.calls)
+
+
+def test_structural_changes_ignore_the_star_and_the_number() -> None:
+    edited = _xhci_disabled(SAMPLE_EXPORT).replace("Value\t=<30>", "Value\t=<45>")
+    assert edited != SAMPLE_EXPORT
+    assert nvram_safety.structural_changes(SAMPLE_EXPORT, edited) == []
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("Width\t=01\nBIOS Default =<30>", "Width\t=04\nBIOS Default =<30>"),
+        ("         [01]Enabled\n\nSetup Question\t= XHCI", "         [01]Enabled\n         [02]Turbo\n\nSetup Question\t= XHCI"),
+        ("BIOS Default =[00]Disabled", "BIOS Default =[01]Enabled"),
+        ("Help String\t= Temperature at which the fan starts.", "Help String\t= Something else"),
+    ],
+)
+def test_structural_changes_catch_other_edits(old: str, new: str) -> None:
+    assert old in SAMPLE_EXPORT
+    assert nvram_safety.structural_changes(SAMPLE_EXPORT, SAMPLE_EXPORT.replace(old, new, 1))
+
+
+def test_structural_changes_flag_an_uncommented_question() -> None:
+    commented = SAMPLE_EXPORT.replace("Setup Question\t= XHCI Hand-off", "//Setup Question\t= XHCI Hand-off")
+    problems = nvram_safety.structural_changes(commented, SAMPLE_EXPORT)
+    assert len(problems) == 1 and "not an active question" in problems[0]
+
+
+def test_export_keeps_a_hand_edited_script_as_bak(tmp_path: Path, scewin_dir: Path) -> None:
+    runner = make_runner(scewin_dir, FakeRun())
+    script = tmp_path / "nvram.txt"
+    script.write_text("my careful edits\n", encoding="utf-8")
+
+    runner.export(script)
+
+    assert (tmp_path / "nvram.txt.bak").read_text(encoding="utf-8") == "my careful edits\n"
+    assert script.read_text(encoding="utf-8") == SAMPLE_EXPORT
+
+
+def test_first_export_has_nothing_to_back_up(tmp_path: Path, scewin_dir: Path) -> None:
+    make_runner(scewin_dir, FakeRun()).export(tmp_path / "nvram.txt")
+    assert not (tmp_path / "nvram.txt.bak").exists()

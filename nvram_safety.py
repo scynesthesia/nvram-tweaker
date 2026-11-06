@@ -21,7 +21,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from nvram_parsing import find_blocks
+from nvram_parsing import OPTION_LINE_PATTERN, VALUE_PATTERN, find_blocks
 from nvram_reconstruction import rebuild_text
 from nvram_structures import OptionField, QuestionBlock, ValueField
 
@@ -220,6 +220,54 @@ def missing_questions(reference_text: str, candidate_text: str) -> List[str]:
     return missing
 
 
+def _mask_line(line: str) -> str:
+    """A body line with the two things this tool may edit blanked out.
+
+    The ``*`` marker of an option line (and SCEWIN's '// Move "*"' hint) and the number of
+    a ``Value`` line are removed, so what is left must be identical in a file that was
+    only edited with this tool.
+    """
+
+    text = line.rstrip()
+    option = OPTION_LINE_PATTERN.match(text)
+    if option:
+        label = _INLINE_COMMENT.split(option.group("label"), maxsplit=1)[0].strip()
+        return f"option [{option.group('code')}]{label}"
+    value = VALUE_PATTERN.search(text)
+    if value:
+        start, end = value.span("value")
+        return text[:start] + "#" + text[end:]
+    return text
+
+
+def structural_changes(reference_text: str, candidate_text: str) -> List[str]:
+    """Describe live questions whose text differs in more than the selected option or number.
+
+    Hand edits to ``Offset``, ``Width``, ``Token``, added or removed options, string values and
+    so on do not show up in :func:`diff_blocks`, which only compares the current setting, yet
+    SCEWIN would write them. Questions that are live in the candidate but were not live in the
+    reference (new, or un-commented) are reported too.
+    """
+
+    reference = _keyed(find_blocks(reference_text)[0])
+    problems: List[str] = []
+    for key, block in _keyed(find_blocks(candidate_text)[0]).items():
+        label = f"'{block.name}' (Token {block.token or 'none'})"
+        before = reference.get(key)
+        if before is None:
+            problems.append(f"{label} was not an active question in the baseline")
+            continue
+        old = [_mask_line(line) for line in before.body.splitlines()]
+        new = [_mask_line(line) for line in block.body.splitlines()]
+        if old == new:
+            continue
+        sample = next((line for line in new if line not in old), None) or next(
+            (line for line in old if line not in new), "(lines reordered)"
+        )
+        problems.append(f"{label}: {sample.strip()!r}")
+    return problems
+
+
 def preflight_issues(text: str) -> List[str]:
     """Return reasons the text should not be imported (empty list means OK).
 
@@ -263,4 +311,5 @@ __all__ = [
     "option_text",
     "preflight_issues",
     "risky_keywords",
+    "structural_changes",
 ]
