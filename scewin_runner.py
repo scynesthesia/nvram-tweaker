@@ -35,7 +35,7 @@ from typing import Callable, Iterable, List, Optional, Sequence
 from nvram_cli_prompts import confirm_write
 from nvram_crc import crc_header_mismatch
 from nvram_editor import restore_point_path
-from nvram_safety import SettingChange, diff_texts, missing_questions, preflight_issues
+from nvram_safety import SettingChange, diff_texts, missing_questions, preflight_issues, structural_changes
 from scewin_diagnostics import REFERENCE_URL, Diagnosis, diagnose, has_errors
 
 SCEWIN_EXE = "SCEWIN_64.exe"
@@ -149,6 +149,9 @@ class SCEWINRunner:
     def export(self, script_path: Path) -> SCEWINResult:
         script_path = Path(script_path).resolve()
         script_path.parent.mkdir(parents=True, exist_ok=True)
+        if script_path.is_file():
+            # SCEWIN overwrites the file; keep what was there (hand edits) as <name>.bak.
+            shutil.copy2(script_path, script_path.with_name(script_path.name + ".bak"))
         result = self._execute("export", ["/o", "/s", str(script_path)], script_path)
 
         created = False
@@ -160,8 +163,37 @@ class SCEWINRunner:
             result = replace(result, restore_point_created=True)
         return result
 
-    def check_import(self, script_path: Path) -> List[str]:
-        """Return preflight problems for a script (empty list means it may be imported)."""
+    def snapshot(self, script_path: Path) -> Path:
+        """Read the live BIOS into ``<name>.preimport<ext>``: the baseline for the next import.
+
+        Reading never changes the BIOS. The diff, the risk check and the integrity checks
+        then compare against what the BIOS holds *now*, not against an export that may be
+        weeks old. If no restore point exists yet, this snapshot becomes it. The file is
+        overwritten by the next snapshot, so it is also the undo for the latest import.
+        """
+
+        script_path = Path(script_path).resolve()
+        target = script_path.with_name(f"{script_path.stem}.preimport{script_path.suffix}")
+        result = self._execute("snapshot", ["/o", "/s", str(target)], script_path)
+        if not result.ok or not target.is_file():
+            lines = "\n".join(result.summary_lines())
+            raise SCEWINError(f"Could not read the current BIOS settings, so nothing was imported.\n{lines}")
+        restore_point = restore_point_path(script_path)
+        if not restore_point.exists():
+            shutil.copy2(target, restore_point)
+        return target
+
+    def _resolve_baseline(self, script_path: Path, baseline: Optional[Path]) -> Optional[Path]:
+        candidate = Path(baseline) if baseline is not None else restore_point_path(script_path)
+        return candidate if candidate.is_file() else None
+
+    def check_import(self, script_path: Path, baseline: Optional[Path] = None) -> List[str]:
+        """Return preflight problems for a script (empty list means it may be imported).
+
+        ``baseline`` is the file to compare against (normally :meth:`snapshot`); it defaults
+        to the restore point. Without any baseline the import is refused: nothing could say
+        what it would change.
+        """
 
         script_path = Path(script_path)
         if not script_path.is_file():
@@ -169,14 +201,22 @@ class SCEWINRunner:
         text = _read_text(script_path)
         issues = preflight_issues(text)
 
-        restore_point = restore_point_path(script_path)
-        if restore_point.is_file() and restore_point.resolve() != script_path.resolve():
-            original = _read_text(restore_point)
+        reference = self._resolve_baseline(script_path, baseline)
+        if reference is None:
+            issues.append(
+                "There is nothing to compare this file with (no restore point and no snapshot of the "
+                "current BIOS), so the changes cannot be checked. Run 'export' first."
+            )
+        elif reference.resolve() != script_path.resolve():
+            original = _read_text(reference)
             mismatch = crc_header_mismatch(original, text)
             if mismatch:
-                issues.append(
-                    f"{mismatch} If you updated the BIOS, delete '{restore_point.name}' and export again."
+                hint = (
+                    f"If you updated the BIOS, delete '{restore_point_path(script_path).name}' and export again."
+                    if reference == restore_point_path(script_path)
+                    else "Export again from the current BIOS."
                 )
+                issues.append(f"{mismatch} {hint}")
             missing = missing_questions(original, text)
             if missing:
                 shown = ", ".join(f"'{name}'" for name in missing[:3])
@@ -185,20 +225,30 @@ class SCEWINRunner:
                     f"{len(missing)} question(s) from your original export are gone from this file ({shown}{more}). "
                     "It may be truncated or damaged. (Commenting a question out with // is fine.)"
                 )
+            altered = structural_changes(original, text)
+            if altered:
+                shown = "; ".join(altered[:3])
+                more = f" (and {len(altered) - 3} more)" if len(altered) > 3 else ""
+                issues.append(
+                    f"{len(altered)} question(s) differ in more than the selected option or number: {shown}{more}. "
+                    "This tool only changes those; if the BIOS changed since the file was exported, export again."
+                )
         return issues
 
-    def changes_since_export(self, script_path: Path) -> Optional[List[SettingChange]]:
-        """Settings that differ from the restore point, or None if there is no restore point."""
+    def changes_since_export(
+        self, script_path: Path, baseline: Optional[Path] = None
+    ) -> Optional[List[SettingChange]]:
+        """Settings that differ from the baseline (default: the restore point), or None if there is none."""
 
         script_path = Path(script_path)
-        restore_point = restore_point_path(script_path)
-        if not restore_point.is_file() or not script_path.is_file():
+        reference = self._resolve_baseline(script_path, baseline)
+        if reference is None or not script_path.is_file():
             return None
-        return diff_texts(_read_text(restore_point), _read_text(script_path))
+        return diff_texts(_read_text(reference), _read_text(script_path))
 
-    def import_script(self, script_path: Path) -> SCEWINResult:
+    def import_script(self, script_path: Path, baseline: Optional[Path] = None) -> SCEWINResult:
         script_path = Path(script_path).resolve()
-        issues = self.check_import(script_path)
+        issues = self.check_import(script_path, baseline)
         if issues:
             raise SCEWINError("Import blocked by preflight checks:\n- " + "\n- ".join(issues))
         return self._execute("import", ["/i", "/s", str(script_path)], script_path)
@@ -209,7 +259,7 @@ class SCEWINRunner:
             raise SCEWINError(
                 f"No restore point found at '{restore_point}'. It is created by the first export."
             )
-        return replace(self.import_script(restore_point), action="restore")
+        return replace(self.import_script(restore_point, baseline=restore_point), action="restore")
 
     def _execute(self, action: str, args: Sequence[str], script_path: Path) -> SCEWINResult:
         if not self._admin_check():
@@ -282,6 +332,11 @@ def add_subcommands(sub: "argparse._SubParsersAction") -> None:
     import_parser.add_argument(
         "--allow-risky", action="store_true", help="Confirm changes to risky settings without asking (scripts)"
     )
+    import_parser.add_argument(
+        "--no-snapshot",
+        action="store_true",
+        help="Do not read the live BIOS first; compare with the restore point instead",
+    )
     restore_parser = sub.add_parser("restore", help="Re-import the untouched copy saved by the first export")
     add_common(restore_parser)
     restore_parser.add_argument("--yes", action="store_true", help="Skip the Y/N question (scripts)")
@@ -320,10 +375,14 @@ def run(
         if args.command == "export":
             result = runner.export(args.file)
         elif args.command == "import":
-            issues = runner.check_import(args.file)
+            baseline = None
+            if not args.no_snapshot:
+                baseline = runner.snapshot(args.file)
+                print(f"Read the current BIOS settings into {baseline.name} (compared against, and your undo).")
+            issues = runner.check_import(args.file, baseline)
             if issues:
                 raise SCEWINError("Import blocked by preflight checks:\n- " + "\n- ".join(issues))
-            risky_lines = _print_changes(runner.changes_since_export(args.file))
+            risky_lines = _print_changes(runner.changes_since_export(args.file, baseline))
             if not confirm_write(
                 "Write these settings to the BIOS now?",
                 risky_lines=risky_lines,
@@ -333,7 +392,7 @@ def run(
                 ask=ask,
             ):
                 return 1
-            result = runner.import_script(args.file)
+            result = runner.import_script(args.file, baseline=baseline)
         else:
             if not confirm_write(
                 "Re-import the original export and undo all changes?",

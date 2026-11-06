@@ -20,13 +20,13 @@ The exe is not code-signed, so Windows SmartScreen may warn about it.
 |---|---|
 | **Byte-exact saves** | Every line you did not edit is written back unchanged, including SCEWIN's odd `\r\r\n` line endings and non-UTF-8 bytes (such as `85°C`). A save with no edits leaves the file identical. |
 | **Atomic writes** | The file is replaced in one step, so a crash cannot leave a half-written export. |
-| **Three copies** | `nvram.txt.bak` is the version before the last save; `nvram.original.txt` is the untouched file from before your first save and is never overwritten; SCEWIN's own output goes to `log-file.txt`. |
+| **Four copies** | `nvram.txt.bak` is the version before the last save **or export** (an export overwrites the file, so your hand-edited script is kept here first); `nvram.original.txt` is the untouched file from before your first save and is never overwritten; `nvram.preimport.txt` is the BIOS as it was just before your latest import (your undo for it); SCEWIN's own output goes to `log-file.txt`. |
 | **`HIICrc32` header is never modified** | It is a checksum of the BIOS's setup database, not of the text, so editing settings never makes it stale. SCEWIN uses it to recognise scripts that belong to the running BIOS. An import is blocked when the header differs from your original export (a script from another BIOS version). |
 | **Value limits** | Numbers must fit the question: the `Width` line is the storage size in bytes (`Width=01` → 0–255, `Width=02` → 0–65535). An explicit `Min`/`Max`, when a file has one, wins. The help text sometimes states a tighter range (for example `[0-800]`); the tool only enforces what the file defines, so read the help. |
 | **Inactive questions are read-only** | SCEWIN comments out questions that do not apply to your board (often a twin of a live question with the same name). They are kept in the file but cannot be selected or edited. |
 | **Risk levels** | See below. |
-| **Import checks** | Before writing to the BIOS: exactly one `*` per option question, same `HIICrc32` header as the original export, and no question missing compared with the original (a truncated or damaged file). Commenting a question out with `//` is the accepted way to skip a setting and is allowed. |
-| **Change list** | Before an import or a save you see exactly which settings change, from what to what. |
+| **Import checks** | Before writing to the BIOS the file is compared with a fresh read of the live BIOS (`nvram.preimport.txt`): exactly one `*` per option question, same `HIICrc32` header, no question missing (a truncated or damaged file), and **no line changed other than the selected option or a number**. An edit to `Offset`, `Width`, `Token`, an option list, the help text, a string, or an un-commented question blocks the import. Commenting a question out with `//` is the accepted way to skip a setting and is allowed. An import with nothing to compare against is refused. |
+| **Change list** | Before an import or a save you see exactly which settings change, from what to what, against what the BIOS holds right now. |
 
 **Risk levels.** Questions whose names contain certain words are treated in two tiers (the lists are in [`nvram_safety.py`](nvram_safety.py)):
 
@@ -82,7 +82,7 @@ NVRAM Tweaker can drive AMI's SCEWIN to get the file from your machine and write
 
 1. **Export** saves the current settings (e.g. `nvram.txt`) and keeps the untouched copy `nvram.original.txt`: your **restore point**.
 2. Edit and save the file (GUI or `set`).
-3. **Import** runs the import checks, lists every difference from the restore point, and asks for confirmation (with an extra acknowledgement for confirm-level settings). Reboot to apply.
+3. **Import** first reads the live BIOS into `nvram.preimport.txt` (read-only), runs the import checks against it, lists every difference, and asks for confirmation (with an extra acknowledgement for confirm-level settings). Reboot to apply. If you export once more after a BIOS update, the old restore point is kept; delete it to start fresh. In the CLI, `import --no-snapshot` skips the live read and compares with the restore point instead.
 4. **Restore** re-imports the restore point and puts every setting back.
 
 SCEWIN's output is saved to `log-file.txt` and explained in plain language (driver not loaded, HII not published, write-protected variables, ...); the same explanations are available offline with `diagnose`.

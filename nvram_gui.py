@@ -91,6 +91,7 @@ class GUIState:
     scewin_runner: Optional[SCEWINRunner] = None
     pending_scewin_action: Optional[str] = None
     pending_scewin_path: Optional[Path] = None
+    pending_scewin_baseline: Optional[Path] = None
     closing: bool = False
 
 
@@ -1132,7 +1133,21 @@ def _open_scewin_confirm(action: str, script_path: Path) -> None:
     runner = state.scewin_runner
     assert runner is not None
 
-    issues = runner.check_import(script_path)
+    baseline: Optional[Path] = None
+    if action == "import":
+        # Read the live BIOS first (read-only): the preview and the checks then compare against
+        # what the BIOS holds now, and the snapshot is the undo for this import.
+        append_log("Reading the current BIOS settings to compare against ...")
+        try:
+            baseline = runner.snapshot(script_path)
+        except SCEWINError as exc:
+            append_log(str(exc))
+            show_message("Import blocked", str(exc))
+            return
+    else:
+        baseline = script_path  # the restore point is its own baseline: there is nothing to diff
+
+    issues = runner.check_import(script_path, baseline)
     if issues:
         text = "Import blocked by preflight checks:\n- " + "\n- ".join(issues)
         append_log(text)
@@ -1147,7 +1162,7 @@ def _open_scewin_confirm(action: str, script_path: Path) -> None:
         ]
         risky = False
     else:
-        changes = runner.changes_since_export(script_path)
+        changes = runner.changes_since_export(script_path, baseline)
         lines = [f"Write this file to NVRAM:\n{script_path}", ""]
         if changes is None:
             lines.append("No restore point exists for this file, so the changes cannot be listed.")
@@ -1166,10 +1181,13 @@ def _open_scewin_confirm(action: str, script_path: Path) -> None:
 
     state.pending_scewin_action = action
     state.pending_scewin_path = script_path
+    state.pending_scewin_baseline = baseline
     dpg.set_value("scewin_confirm_text", "\n".join(lines))
     dpg.set_value("scewin_risk_ack", False)
     dpg.configure_item("scewin_risk_ack", show=risky)
     dpg.configure_item("scewin_confirm_modal", show=True)
+    if action == "import" and baseline is not None:
+        append_log(f"Compared against the live BIOS ({baseline.name}); it is also your undo for this import.")
 
 
 def on_scewin_import(sender: int, app_data: object) -> None:
@@ -1198,6 +1216,7 @@ def on_scewin_cancel(sender: int, app_data: object) -> None:
     dpg.configure_item("scewin_confirm_modal", show=False)
     state.pending_scewin_action = None
     state.pending_scewin_path = None
+    state.pending_scewin_baseline = None
     append_log("SCEWIN import cancelled; NVRAM was not touched.")
 
 
@@ -1205,6 +1224,7 @@ def on_scewin_confirm(sender: int, app_data: object) -> None:
     runner = state.scewin_runner
     action = state.pending_scewin_action
     script_path = state.pending_scewin_path
+    baseline = state.pending_scewin_baseline
     if runner is None or action is None or script_path is None:
         dpg.configure_item("scewin_confirm_modal", show=False)
         return
@@ -1215,9 +1235,10 @@ def on_scewin_confirm(sender: int, app_data: object) -> None:
     dpg.configure_item("scewin_confirm_modal", show=False)
     state.pending_scewin_action = None
     state.pending_scewin_path = None
+    state.pending_scewin_baseline = None
     append_log(f"Running SCEWIN {action} from {script_path} ...")
     try:
-        result = replace(runner.import_script(script_path), action=action)
+        result = replace(runner.import_script(script_path, baseline=baseline), action=action)
     except SCEWINError as exc:
         append_log(str(exc))
         show_message(f"{action.capitalize()} failed", str(exc))
