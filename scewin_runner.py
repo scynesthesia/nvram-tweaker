@@ -43,6 +43,15 @@ REQUIRED_FILES = (SCEWIN_EXE, "amifldrv64.sys", "amigendrv64.sys")
 DEFAULT_SCRIPT_NAME = "nvram.txt"
 LOG_FILE_NAME = "log-file.txt"
 DEFAULT_TIMEOUT_SECONDS = 300
+# Writing can legitimately take long on some boards, and killing SCEWIN mid-write is the one
+# thing worth avoiding; the limit only exists so a hung process does not freeze the GUI forever.
+DEFAULT_IMPORT_TIMEOUT_SECONDS = 1800
+# Diagnosis keys (scewin_diagnostics) for failures that happen before SCEWIN writes anything.
+PRE_WRITE_ERRORS = frozenset({"driver", "error57", "no_hii", "bios_incompatible", "platform_id"})
+PARTIAL_WRITE_WARNING = (
+    "Some settings may already have been written. Do not reboot yet: run 'restore' (or import "
+    "your restore point), then export again and check the result."
+)
 
 RunFunction = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -65,11 +74,27 @@ class SCEWINResult:
     def ok(self) -> bool:
         return self.returncode == 0 and not has_errors(self.diagnoses)
 
+    @property
+    def may_be_partial(self) -> bool:
+        """True for a failed write that did not clearly stop before touching the BIOS.
+
+        A driver, command-line or compatibility error means SCEWIN never started writing;
+        anything else (write errors, an unexplained non-zero exit) may have written some
+        variables and not others.
+        """
+
+        if self.ok or self.action not in ("import", "restore"):
+            return False
+        errors = [d.key for d in self.diagnoses if d.severity == "error"]
+        return not errors or any(key not in PRE_WRITE_ERRORS for key in errors)
+
     def summary_lines(self) -> List[str]:
         status = "succeeded" if self.ok else f"failed (exit code {self.returncode})"
         lines = [f"SCEWIN {self.action} {status}. Output saved to {self.log_path}."]
         if self.restore_point_created:
             lines.append("Saved an untouched restore point of this export.")
+        if self.may_be_partial:
+            lines.append(f"WARNING: {PARTIAL_WRITE_WARNING}")
         for diagnosis in self.diagnoses:
             lines.extend(diagnosis.format().splitlines())
         if self.diagnoses:
@@ -136,11 +161,13 @@ class SCEWINRunner:
         run: RunFunction = subprocess.run,
         admin_check: Callable[[], bool] = is_admin,
         timeout: int = DEFAULT_TIMEOUT_SECONDS,
+        import_timeout: int = DEFAULT_IMPORT_TIMEOUT_SECONDS,
     ) -> None:
         self.scewin_dir = find_scewin(scewin_dir)
         self._run = run
         self._admin_check = admin_check
         self.timeout = timeout
+        self.import_timeout = import_timeout
 
     @property
     def exe_path(self) -> Path:
@@ -266,6 +293,9 @@ class SCEWINRunner:
             raise SCEWINError("SCEWIN needs administrator rights. Re-run nvram-tweaker as administrator.")
 
         command = [str(self.exe_path), *args]
+        writes = action == "import"
+        timeout = self.import_timeout if writes else self.timeout
+        extra = _window_options(os.name == "nt")
         try:
             completed = self._run(
                 command,
@@ -273,12 +303,19 @@ class SCEWINRunner:
                 capture_output=True,
                 text=True,
                 errors="replace",
-                timeout=self.timeout,
+                timeout=timeout,
+                stdin=subprocess.DEVNULL,  # SCEWIN must never wait for a keypress nobody can give
+                **extra,
             )
         except FileNotFoundError as exc:
             raise SCEWINError(f"Could not start {self.exe_path}: {exc}") from exc
         except subprocess.TimeoutExpired as exc:
-            raise SCEWINError(f"SCEWIN did not finish within {self.timeout} seconds.") from exc
+            if writes:
+                raise SCEWINError(
+                    f"SCEWIN was stopped after {timeout} seconds while writing to the BIOS. "
+                    f"{PARTIAL_WRITE_WARNING}"
+                ) from exc
+            raise SCEWINError(f"SCEWIN did not finish within {timeout} seconds.") from exc
         except OSError as exc:
             raise SCEWINError(f"Could not run SCEWIN: {exc}") from exc
 
@@ -293,6 +330,16 @@ class SCEWINRunner:
             log_path=log_path,
             diagnoses=diagnose(output),
         )
+
+
+CREATE_NO_WINDOW = 0x08000000  # subprocess.CREATE_NO_WINDOW exists on Windows only
+
+
+def _window_options(is_windows: bool) -> dict:
+    """Extra ``subprocess.run`` options. The GUI exe has no console: without CREATE_NO_WINDOW
+    Windows flashes a console window for every SCEWIN call. (Not valid on other systems.)"""
+
+    return {"creationflags": CREATE_NO_WINDOW} if is_windows else {}
 
 
 def _read_text(path: Path) -> str:
