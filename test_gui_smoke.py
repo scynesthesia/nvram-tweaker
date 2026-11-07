@@ -40,6 +40,7 @@ def gui(monkeypatch, tmp_path):
         "setup_dearpygui",
         "show_viewport",
         "set_viewport_resize_callback",
+        "set_viewport_title",
         "set_primary_window",
         "set_exit_callback",
         "start_dearpygui",

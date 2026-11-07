@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 import dearpygui.dearpygui as dpg
 from tkinter import Tk, filedialog
 
+import nvram_settings
 from nvram_editor import NVRAMManager, apply_changes
 from nvram_parsing import OPTION_LINE_PATTERN, VALUE_PATTERN, validate_numeric_input
 from nvram_safety import current_setting, find_risky_blocks
@@ -756,6 +757,11 @@ def handle_change_request(change: "PendingChange") -> None:
     if not risky:
         apply_pending_change(change)
         return
+    if nvram_settings.expert_mode():
+        names = ", ".join(block.name for block, _ in risky[:3])
+        append_log(f"Expert mode: applied without a risk prompt ({len(risky)} confirm-level question(s): {names}).")
+        apply_pending_change(change)
+        return
 
     state.pending_change = change
     lines = [
@@ -907,6 +913,60 @@ def perform_save(sender: int, app_data: object) -> None:
         update_question_list(dpg.get_value("search_input") or "")
     append_log("Cleared change markers; on-disk file now matches the UI.")
     _hide_save_confirm_modal(sender, app_data)
+
+
+def _window_title() -> str:
+    suffix = "  [EXPERT MODE]" if nvram_settings.expert_mode() else ""
+    return f"NVRAM Tweaker {__version__}{suffix}"
+
+
+def refresh_expert_indicator() -> None:
+    """Keep the checkbox, the window label and the title bar in step with the stored setting."""
+
+    enabled = nvram_settings.expert_mode()
+    if dpg.does_item_exist("expert_mode_checkbox"):
+        dpg.set_value("expert_mode_checkbox", enabled)
+    if dpg.does_item_exist("primary_window"):
+        dpg.configure_item("primary_window", label=_window_title())
+    try:
+        dpg.set_viewport_title(_window_title())
+    except Exception:  # no viewport yet (or a headless test)
+        pass
+
+
+def on_expert_toggle(sender: int, app_data: object) -> None:
+    if app_data:
+        # Turning it on needs the acknowledgement: undo the tick until it is given.
+        dpg.set_value("expert_mode_checkbox", False)
+        dpg.set_value("expert_ack", False)
+        dpg.configure_item("expert_confirm_modal", show=True)
+        return
+    try:
+        nvram_settings.set_expert_mode(False)
+    except OSError as exc:
+        append_log(f"Could not save the setting: {exc}")
+    refresh_expert_indicator()
+    append_log("Expert mode is off.")
+
+
+def on_expert_cancel(sender: int, app_data: object) -> None:
+    dpg.configure_item("expert_confirm_modal", show=False)
+    refresh_expert_indicator()
+
+
+def on_expert_confirm(sender: int, app_data: object) -> None:
+    if not dpg.get_value("expert_ack"):
+        append_log("Tick the acknowledgement to turn expert mode on.")
+        return
+    dpg.configure_item("expert_confirm_modal", show=False)
+    try:
+        nvram_settings.set_expert_mode(True, acknowledged=True)
+    except OSError as exc:
+        append_log(f"Could not save the setting: {exc}")
+        show_message("Expert mode not saved", f"The setting could not be written:\n{exc}")
+    else:
+        append_log("Expert mode is on: risky settings no longer ask for confirmation.")
+    refresh_expert_indicator()
 
 
 def _quit() -> None:
@@ -1176,7 +1236,8 @@ def _open_scewin_confirm(action: str, script_path: Path) -> None:
             lines.extend(f"- {change.format()}" for change in changes[:25])
             if len(changes) > 25:
                 lines.append(f"...and {len(changes) - 25} more.")
-            risky = any(change.risk_keywords for change in changes)
+            # The risky changes stay listed with their [RISK] tags; expert mode only drops the extra tick box.
+            risky = any(change.risk_keywords for change in changes) and not nvram_settings.expert_mode()
     lines += ["", "Changes take effect after a reboot."]
 
     state.pending_scewin_action = action
@@ -1303,7 +1364,7 @@ def build_ui() -> None:
     apply_dark_theme()
     layout = _calculate_layout_metrics()
 
-    with dpg.window(tag="primary_window", label=f"NVRAM Tweaker {__version__}", width=1200, height=820):
+    with dpg.window(tag="primary_window", label=_window_title(), width=1200, height=820):
         dpg.add_spacer(height=8)
 
         with dpg.group(horizontal=True, horizontal_spacing=8):
@@ -1320,6 +1381,17 @@ def build_ui() -> None:
                     dpg.add_button(label="Restore original", tag="scewin_restore_button", callback=on_scewin_restore)
                     with dpg.tooltip(parent="scewin_restore_button"):
                         dpg.add_text("Re-imports the untouched copy saved by your first export.")
+                dpg.add_checkbox(
+                    tag="expert_mode_checkbox",
+                    label="Expert mode (skip risk prompts)",
+                    default_value=nvram_settings.expert_mode(),
+                    callback=on_expert_toggle,
+                )
+                with dpg.tooltip(parent="expert_mode_checkbox"):
+                    dpg.add_text(
+                        "Stops asking before you change risky settings. The change list, the integrity "
+                        "checks and the final write question stay."
+                    )
                 dpg.add_input_text(
                     tag="search_input",
                     label="Search",
@@ -1436,6 +1508,19 @@ def build_ui() -> None:
             dpg.add_button(label="Cancel", callback=on_scewin_cancel)
             dpg.add_button(label="Write to NVRAM", callback=on_scewin_confirm)
 
+    with dpg.window(tag="expert_confirm_modal", modal=True, show=False, no_move=True, no_close=True, no_resize=True):
+        dpg.add_text("Turn on expert mode", color=(255, 170, 120))
+        dpg.add_separator()
+        dpg.add_text(
+            "Risky settings (voltages, power limits, XHCI, CSM, Secure Boot, TPM, ...) will no longer "
+            "ask for confirmation. You still see the change list, and the final write still asks.",
+            wrap=520,
+        )
+        dpg.add_checkbox(tag="expert_ack", label="I understand this can brick my machine and I know how to clear CMOS.")
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Cancel", callback=on_expert_cancel)
+            dpg.add_button(label="Turn on expert mode", callback=on_expert_confirm)
+
     with dpg.window(tag="message_modal", modal=True, show=False, no_move=True, no_resize=True):
         dpg.add_text("", tag="message_title")
         dpg.add_separator()
@@ -1451,7 +1536,7 @@ def build_ui() -> None:
             dpg.add_button(label="Discard and close", callback=on_close_discard)
             dpg.add_button(label="Save and close", callback=on_close_save)
 
-    dpg.create_viewport(title=f"NVRAM Tweaker {__version__}", width=1200, height=840, resizable=True, disable_close=True)
+    dpg.create_viewport(title=_window_title(), width=1200, height=840, resizable=True, disable_close=True)
     dpg.set_exit_callback(on_close_requested)
     dpg.setup_dearpygui()
     dpg.show_viewport()
