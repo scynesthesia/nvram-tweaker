@@ -8,97 +8,81 @@ from __future__ import annotations
 
 import argparse
 import logging
-import mmap
+import os
 import re
-from collections import deque
+import shutil
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 
-from nvram_crc import _contains_crc_marker, recalculate_crc
+from nvram_crc import extract_crc_header, preserve_crc_header
 from nvram_parsing import (
-    BLOCK_PATTERN,
-    HELP_PATTERN,
-    MAX_PATTERN,
-    MIN_PATTERN,
-    NUMERIC_INPUT_PATTERN,
     OPTION_LINE_PATTERN,
-    SETUP_BOUNDARY_PATTERN,
-    TOKEN_PATTERN,
-    TOKEN_VALIDATION_PATTERN,
     VALUE_PATTERN,
     find_blocks,
     matches_name,
+    normalize_token,
     selected_option,
-    validate_numeric_input,
 )
 from nvram_reconstruction import rebuild_text
 from nvram_structures import OptionField, QuestionBlock, ValueField
 
 LOGGER = logging.getLogger(__name__)
 
-MMAP_READ_THRESHOLD = 4 * 1024 * 1024
-TOOL_VERSION = "0.0.0-dev"
-
-def _read_file_via_mmap(path: Path) -> bytes:
-    """
-    Read file contents using a memory map to limit peak memory usage for large files.
-    """
-    with path.open("rb") as handle:
-        with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mm_obj:
-            return mm_obj.read()
-
 
 def _decode_bytes(raw_bytes: bytes, path: Path) -> tuple[str, str]:
+    """Decode as UTF-8, falling back to latin-1 (which accepts every byte sequence)."""
+
     try:
         return raw_bytes.decode("utf-8"), "utf-8"
     except UnicodeDecodeError as exc:
-        try:
-            text = raw_bytes.decode("latin-1")
-        except UnicodeDecodeError:
-            preview = raw_bytes[: exc.start].decode("utf-8", errors="ignore")
-            line_number = preview.count("\n") + 1
-            raise ValueError(
-                f"Failed to decode '{path}' as UTF-8 or latin-1 near line {line_number}: {exc.reason}."
-            ) from exc
-
         preview = raw_bytes[: exc.start].decode("utf-8", errors="ignore")
         line_number = preview.count("\n") + 1
-        LOGGER.warning(
-            "Decoded '%s' with latin-1 after UTF-8 failure near line %d.",
-            path,
-            line_number,
-        )
-        return text, "latin-1"
+        # Expected, not a problem: SCEWIN writes in a Windows code page (e.g. "85\xb0C" options).
+        # latin-1 maps every byte to a character, so reading and saving is lossless.
+        LOGGER.info("Read '%s' as latin-1 (non-UTF-8 byte near line %d).", path, line_number)
+        return raw_bytes.decode("latin-1"), "latin-1"
+
+
+def restore_point_path(script_path: Path) -> Path:
+    """Where the untouched copy of an export lives: ``nvram.txt`` -> ``nvram.original.txt``."""
+
+    return script_path.with_name(f"{script_path.stem}.original{script_path.suffix}")
+
+
+def _write_atomically(path: Path, data: bytes) -> None:
+    """Replace ``path`` with ``data`` so a crash can never leave a half-written file."""
+
+    temp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        with temp_path.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            shutil.copymode(path, temp_path)
+        except OSError:
+            pass  # keep default permissions if the original's cannot be read
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 class NVRAMManager:
     def __init__(self) -> None:
         self.path: Optional[Path] = None
-        self.original_text: Optional[str] = None
         self.blocks: List[QuestionBlock] = []
         self.trailing_text: str = ""
         self.initial_crc: Optional[str] = None
-        self.has_crc_marker: bool = False
-        self.line_ending: str = "\n"
-        self._backup_via_copy: bool = False
         self._encoding: str = "utf-8"
         self.last_saved_text: Optional[str] = None
-        self.undo_stack: deque[str] = deque(maxlen=5)
 
     def load_file(self, path: Path) -> "NVRAMManager":
         if not path.exists():
             raise ValueError(f"The file '{path}' does not exist. Please provide a valid path.")
 
-        file_size = path.stat().st_size
-        use_mmap = file_size >= MMAP_READ_THRESHOLD
         try:
-            if use_mmap:
-                raw_bytes = _read_file_via_mmap(path)
-                self._backup_via_copy = True
-            else:
-                raw_bytes = path.read_bytes()
-                self._backup_via_copy = False
+            raw_bytes = path.read_bytes()
         except OSError as exc:
             raise ValueError(f"Unable to read '{path}': {exc}") from exc
 
@@ -110,36 +94,20 @@ class NVRAMManager:
             raise ValueError(f"Unable to parse Setup Question blocks: {exc}") from exc
 
         self.path = path
-        self.original_text = None if self._backup_via_copy else text
         self.last_saved_text = text
-        self.undo_stack.clear()
-        self.initial_crc = self._extract_crc_header(text)
-        self.has_crc_marker = _contains_crc_marker(text)
-        self.line_ending = "\r\n" if "\r\n" in text else "\n"
+        self.initial_crc = extract_crc_header(text)
         return self
 
-    @staticmethod
-    def _extract_crc_header(text: str) -> Optional[str]:
-        lines = text.splitlines()
-        first_line = lines[0].strip() if lines else ""
-        if first_line.startswith("HIICrc32"):
-            return first_line
-        return None
-
-    def _normalize_newlines(self, content: str) -> str:
-        content = content.replace("\r\n", "\n").replace("\r", "\n")
-        if self.line_ending == "\n":
-            return content
-        return self.line_ending.join(content.split("\n"))
-
     def update_value(self, block: QuestionBlock, new_value: int) -> QuestionBlock:
-        def replace_match(match: re.Match[str]) -> str:
-            return f"Value = <{new_value}>"
-
+        _require_editable(block)
         body = block.body
-        if not VALUE_PATTERN.search(body):
+        value_match = VALUE_PATTERN.search(body)
+        if not value_match:
             raise ValueError("Block does not contain a Value line")
-        new_body = VALUE_PATTERN.sub(replace_match, body, count=1)
+        # Replace only the number, so the form (``<30>`` or bare ``30``), the spacing
+        # and the line ending all survive.
+        start, end = value_match.span("value")
+        new_body = body[:start] + str(new_value) + body[end:]
         new_fields: List[OptionField | ValueField] = []
         for field in block.fields:
             if isinstance(field, ValueField):
@@ -149,6 +117,8 @@ class NVRAMManager:
         return block.with_body(new_body).with_fields(new_fields)
 
     def update_options(self, block: QuestionBlock, option_label: str) -> QuestionBlock:
+        _require_editable(block)
+
         def _normalize(text: str) -> str:
             return re.sub(r"\s+", "", text).lower()
 
@@ -194,7 +164,8 @@ class NVRAMManager:
             prefix = opt_match.group("prefix")
             code = opt_match.group("code")
             label = opt_match.group("label").rstrip("\r\n")
-            line_ending = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
+            # Keep the line's real terminator, including odd ones such as "\r\r\n".
+            line_ending = line[len(line.rstrip("\r\n")) :]
 
             is_target = option_counter == target_option_index
             if is_target:
@@ -214,31 +185,41 @@ class NVRAMManager:
 
         return block.with_body("".join(new_lines)).with_fields(new_fields)
 
-    def filter_blocks(self, query: str, exact: bool, token: Optional[str]) -> List[QuestionBlock]:
-        filtered = [b for b in self.blocks if matches_name(b, query, exact)]
-        if token is not None:
-            filtered = [b for b in filtered if b.token == token]
-        return filtered
+    def matching_indices(self, query: str, exact: bool, token: Optional[str]) -> List[int]:
+        """Positions of the active (not commented-out) questions that match.
 
-    def save(
-        self,
-        path: Path,
-        new_content: str,
-        *,
-        bypass_crc: bool = False,
-        bypass_crc_mode: str = "empty",
-        force_crc_bypass: bool = False,
-    ) -> None:
-        if (
-            bypass_crc
-            and not force_crc_bypass
-            and bypass_crc_mode in {"remove", "empty"}
-            and self.has_crc_marker
-        ):
-            raise ValueError(
-                "Unsafe CRC bypass blocked: refusing to remove or empty HIICrc32 when a CRC marker is present. "
-                "Enable force mode to proceed."
-            )
+        ``token`` is compared as a hexadecimal number, so ``7D1``, ``0x7d1`` and
+        ``007D1`` all select the same question.
+        """
+
+        wanted: Optional[str] = None
+        if token is not None:
+            try:
+                wanted = normalize_token(token)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid token '{token}': tokens are hexadecimal as printed in the export, e.g. 7D1 or 0x7D1."
+                ) from None
+
+        indices = []
+        for index, block in enumerate(self.blocks):
+            if block.is_commented or not matches_name(block, query, exact):
+                continue
+            if wanted is not None and (block.token is None or normalize_token(block.token) != wanted):
+                continue
+            indices.append(index)
+        return indices
+
+    def filter_blocks(self, query: str, exact: bool, token: Optional[str]) -> List[QuestionBlock]:
+        return [self.blocks[i] for i in self.matching_indices(query, exact, token)]
+
+    def save(self, path: Path, new_content: str) -> None:
+        """Write ``new_content`` to ``path`` after backing up the current file.
+
+        The original ``HIICrc32`` header is always written back verbatim; see
+        :mod:`nvram_crc` for why it is never modified.
+        """
+
         if self.path is None:
             raise ValueError("No file is currently loaded; cannot save changes.")
 
@@ -255,33 +236,20 @@ class NVRAMManager:
                 "overwriting external edits."
             )
 
-        backup_path = path.with_name(path.name + ".bak")
-        backup_path.write_text(current_disk_text, encoding=self._encoding)
-        self.undo_stack.append(current_disk_text)
+        # The first save also keeps the untouched file, so the original survives any number
+        # of later saves (the .bak only ever holds the previous version).
+        restore_point = restore_point_path(path)
+        if not path.stem.endswith(".original") and not restore_point.exists():
+            shutil.copyfile(path, restore_point)
+        # A byte-for-byte copy: re-encoding or newline translation would alter the backup.
+        shutil.copyfile(path, path.with_name(path.name + ".bak"))
 
-        updated_content = recalculate_crc(
-            new_content,
-            self.initial_crc,
-            bypass=bypass_crc,
-            bypass_mode=bypass_crc_mode,
-            tool_version=TOOL_VERSION,
-        )
-        updated_content = self._normalize_newlines(updated_content)
-        path.write_text(updated_content, encoding=self._encoding, newline="")
+        # Edits keep each line's own ending, so no newline conversion is done here:
+        # real exports mix \r\n and \r\r\n and must be written back exactly.
+        updated_content = preserve_crc_header(new_content, self.initial_crc)
+        _write_atomically(path, updated_content.encode(self._encoding))
         self.last_saved_text = updated_content
         self._refresh_state_from_text(updated_content)
-
-    def rollback_last_save(self) -> None:
-        if self.path is None:
-            raise ValueError("No file is currently loaded; cannot roll back.")
-
-        if not self.undo_stack:
-            raise ValueError("No prior save is available to roll back to.")
-
-        previous_content = self.undo_stack.pop()
-        self.path.write_text(previous_content, encoding=self._encoding, newline="")
-        self.last_saved_text = previous_content
-        self._refresh_state_from_text(previous_content)
 
     def rebuild_text(self, blocks: Optional[List[QuestionBlock]] = None) -> str:
         """Round-trip blocks back to text while preserving formatting.
@@ -301,16 +269,28 @@ class NVRAMManager:
             raise ValueError(
                 "Detected divergence after re-parsing the pending changes; save aborted to prevent data loss."
             )
+        # The round-trip above is only a sanity check: the parser keeps any text it does not
+        # understand, so it holds for almost anything. This is the check that can fail.
+        # Edits only move '*' or change numbers, so the list of questions must be identical;
+        # a merged, lost or un-commented question would still round-trip.
+        def identity(blocks):
+            return [(b.name, b.token, b.is_commented) for b in blocks]
+
+        if identity(reparsed_blocks) != identity(self.blocks):
+            raise ValueError(
+                "The pending changes would add, remove or merge Setup Questions; save aborted to prevent data loss."
+            )
 
     def _read_text_from_disk(self, path: Path) -> str:
         try:
             with path.open("r", encoding=self._encoding, newline="") as handle:
                 return handle.read()
         except UnicodeDecodeError:
+            # The file changed to something that is no longer valid in our encoding; latin-1 reads any bytes.
             try:
                 with path.open("r", encoding="latin-1", newline="") as handle:
                     return handle.read()
-            except (UnicodeDecodeError, OSError) as exc:
+            except OSError as exc:
                 raise ValueError(str(exc)) from exc
         except OSError as exc:
             raise ValueError(str(exc)) from exc
@@ -319,26 +299,8 @@ class NVRAMManager:
         try:
             self.blocks, self.trailing_text = find_blocks(text)
         except re.error as exc:
-            raise ValueError(f"Unable to re-parse content after save/rollback: {exc}") from exc
-        self.initial_crc = self._extract_crc_header(text)
-        self.has_crc_marker = _contains_crc_marker(text)
-        self.line_ending = "\r\n" if "\r\n" in text else "\n"
-
-
-def matches_name(block: QuestionBlock, query: str, exact: bool) -> bool:
-    if exact:
-        return block.name == query
-    return query.lower() in block.name.lower()
-
-
-def selected_option(body: str) -> Optional[str]:
-    for line in body.splitlines():
-        opt_match = OPTION_LINE_PATTERN.match(line)
-        if opt_match and opt_match.group("star"):
-            code = opt_match.group("code")
-            label = opt_match.group("label").rstrip()
-            return f"*[{code}]{label}"
-    return None
+            raise ValueError(f"Unable to re-parse content after save: {exc}") from exc
+        self.initial_crc = extract_crc_header(text)
 
 
 def describe_block(block: QuestionBlock) -> str:
@@ -367,11 +329,27 @@ def format_help_text(help_string: Optional[str]) -> str:
     return help_text
 
 
+def _require_editable(block: QuestionBlock) -> None:
+    if block.is_commented:
+        raise ValueError(
+            f"'{block.name}' is commented out in the export (inactive on this system), so it cannot be edited."
+        )
+
+
 def _validate_value_range(block: QuestionBlock, new_value: int) -> None:
-    if block.min_value is not None and new_value < block.min_value:
-        raise ValueError(f"Value {new_value} is below Min {block.min_value}.")
-    if block.max_value is not None and new_value > block.max_value:
-        raise ValueError(f"Value {new_value} is above Max {block.max_value}.")
+    """Reject values the question cannot hold: explicit Min/Max, else its byte Width."""
+
+    low, high = block.value_bounds()
+    if low is not None and new_value < low:
+        if block.min_value is not None:
+            raise ValueError(f"Value {new_value} is below Min {low}.")
+        raise ValueError(f"Value {new_value} is below {low}; this setting cannot be negative.")
+    if high is not None and new_value > high:
+        if block.max_value is not None:
+            raise ValueError(f"Value {new_value} is above Max {high}.")
+        raise ValueError(
+            f"Value {new_value} is above {high}, the largest a {block.width}-byte setting can hold."
+        )
 
 
 def apply_changes(
@@ -400,132 +378,42 @@ def apply_changes(
     return updated_blocks
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Update AMI SCE NVRAM configuration blocks.")
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Arguments of the original ``nvram_editor.py`` command (kept for existing scripts)."""
+
+    parser = argparse.ArgumentParser(
+        description="Update AMI SCE NVRAM configuration blocks. "
+        "Prefer nvram_tweaker_cli.py (list / show / set / export / import / restore)."
+    )
     parser.add_argument("file", type=Path, help="Path to the NVRAM configuration file")
     parser.add_argument("query", help="Question name to search (exact or partial)")
     parser.add_argument("value", help="New option label substring or numeric value, depending on the block type")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Perform all steps without writing any changes to disk",
-    )
-    parser.add_argument(
-        "--token",
-        help="Token identifier to disambiguate repeated questions",
-    )
-    parser.add_argument(
-        "--exact",
-        action="store_true",
-        help="Require an exact question name match instead of partial",
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Apply the change to all matching blocks; otherwise only the first is changed",
-    )
+    parser.add_argument("--dry-run", action="store_true", help="Show the changes without writing anything")
+    parser.add_argument("--token", help="Token (hexadecimal) to disambiguate repeated questions")
+    parser.add_argument("--exact", action="store_true", help="Require an exact question name match")
+    parser.add_argument("--all", action="store_true", help="Apply the change to every matching question")
     parser.add_argument(
         "--mode",
         choices=["option", "value"],
         required=True,
-        help="Specify whether the target uses option lines (move *) or a numeric Value",
+        help="Whether the target uses option lines (move *) or a numeric Value",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def _validate_value_arg(raw_value: str) -> tuple[int, Optional[str]]:
-    try:
-        return validate_numeric_input(raw_value)
-    except ValueError as exc:
-        raise ValueError(str(exc))
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Old entry point: forwards to ``nvram_tweaker_cli.py set``."""
 
+    args = parse_args(argv)
+    from nvram_tweaker_cli import main as cli_main
 
-def main() -> int:
-    args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-    try:
-        manager = NVRAMManager().load_file(args.file)
-        blocks = manager.blocks
-
-        candidates = manager.filter_blocks(args.query, args.exact, args.token)
-
-        if not candidates:
-            raise ValueError("No matching Setup Question blocks found")
-
-        target_indices = [blocks.index(b) for b in candidates]
-        if len(target_indices) > 1 and not args.all and args.token is None:
-            LOGGER.info("Multiple matching blocks found:")
-            for display_index, block_index in enumerate(target_indices, start=1):
-                description = describe_block(blocks[block_index])
-                formatted_description = "\n   ".join(description.splitlines())
-                LOGGER.info("%s. %s", display_index, formatted_description)
-            while True:
-                selection = input(
-                    'Select the indices to modify (comma-separated, e.g., "1,3,5") or "A" for all: '
-                ).strip()
-                if selection.lower() == "a":
-                    break
-
-                try:
-                    chosen_numbers = [int(part.strip()) for part in selection.split(",") if part.strip()]
-                except ValueError:
-                    chosen_numbers = []
-
-                if chosen_numbers and all(1 <= num <= len(target_indices) for num in chosen_numbers):
-                    unique_indices = []
-                    for num in chosen_numbers:
-                        block_idx = target_indices[num - 1]
-                        if block_idx not in unique_indices:
-                            unique_indices.append(block_idx)
-                    target_indices = unique_indices
-                    break
-                LOGGER.info("Invalid selection. Please try again.")
-        elif not args.all:
-            target_indices = target_indices[:1]
-
-        option_label: Optional[str] = args.value if args.mode == "option" else None
-        new_value: Optional[int]
-        value_conversion_note: Optional[str] = None
-
-        if args.mode == "value":
-            raw_value = args.value.strip()
-            try:
-                new_value, value_conversion_note = _validate_value_arg(raw_value)
-            except ValueError as exc:
-                raise ValueError(str(exc)) from exc
-        else:
-            new_value = None
-
-        before_descriptions = {idx: describe_block(blocks[idx]) for idx in target_indices}
-        try:
-            updated_blocks = apply_changes(manager, blocks, target_indices, option_label, new_value)
-        except ValueError as exc:
-            raise ValueError(f"Could not update the requested block(s): {exc}") from exc
-        after_descriptions = {idx: describe_block(updated_blocks[idx]) for idx in target_indices}
-
-        LOGGER.info("Summary of changes (Before -> After):")
-        if value_conversion_note:
-            LOGGER.info("  %s", value_conversion_note)
-        for idx in target_indices:
-            LOGGER.info("- %s", before_descriptions[idx])
-            LOGGER.info("  -> %s", after_descriptions[idx])
-
-        confirmation = input("Apply these changes? (Y/N): ").strip().lower()
-        if confirmation not in {"y", "yes"}:
-            raise ValueError("No changes applied; user cancelled at confirmation step.")
-
-        manager.blocks = updated_blocks
-        new_text = manager.rebuild_text(updated_blocks)
-        if args.dry_run:
-            LOGGER.info("[DRY RUN] No changes were written to disk.")
-            return 0
-
-        manager.save(args.file, new_text)
-        return 0
-    except ValueError as exc:
-        LOGGER.error("%s", exc)
-        return 1
+    forwarded = ["set", str(args.file), args.query, args.value, "--mode", args.mode]
+    for flag, enabled in (("--dry-run", args.dry_run), ("--exact", args.exact), ("--all", args.all)):
+        if enabled:
+            forwarded.append(flag)
+    if args.token is not None:
+        forwarded += ["--token", args.token]
+    return cli_main(forwarded)
 
 
 if __name__ == "__main__":

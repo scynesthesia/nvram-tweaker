@@ -2,20 +2,27 @@ from __future__ import annotations
 
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import dearpygui.dearpygui as dpg
 from tkinter import Tk, filedialog
 
-from nvram_editor import (
-    NVRAMManager,
-    QuestionBlock,
-    OPTION_LINE_PATTERN,
-    VALUE_PATTERN,
-    validate_numeric_input,
-    apply_changes,
+import nvram_settings
+from nvram_editor import NVRAMManager, apply_changes
+from nvram_parsing import OPTION_LINE_PATTERN, VALUE_PATTERN, validate_numeric_input
+from nvram_safety import current_setting, find_risky_blocks
+from nvram_structures import QuestionBlock
+from nvram_version import __version__
+from scewin_runner import (
+    DEFAULT_SCRIPT_NAME,
+    SCEWINError,
+    SCEWINResult,
+    SCEWINRunner,
+    default_scewin_candidates,
+    guess_scewin_dir,
+    restore_point_path,
 )
 
 
@@ -25,11 +32,7 @@ def resource_path(relative_path: str) -> str:
 
 
 INLINE_COMMENT_PATTERN = re.compile(r"\s//")
-BYPASS_MODE_LABELS = {
-    "Empty CRC value (unsafe)": "empty",
-    "Remove CRC line (unsafe)": "remove",
-    "Version placeholder": "placeholder",
-}
+INT32_MAX = 2**31 - 1
 DEFAULT_VIEWPORT_WIDTH = 1200
 DEFAULT_VIEWPORT_HEIGHT = 840
 SIDEBAR_WIDTH_MIN = 320
@@ -67,7 +70,6 @@ class PendingChange:
     option_display: Optional[str] = None
     new_value: Optional[int] = None
     conversion_note: Optional[str] = None
-    is_batch: bool = False
 
 
 @dataclass
@@ -87,16 +89,11 @@ class GUIState:
     batch_list_theme: Optional[int] = None
     select_all_flash_theme: Optional[int] = None
     modified_sidebar_theme: Optional[int] = None
-
-    def reset(self) -> None:
-        self.blocks = []
-        self.original_blocks = []
-        self.label_to_index = {}
-        self.selected_index = None
-        self.selected_indices = []
-        self.log_messages = []
-        self.pending_change = None
-        self.modified_indices = set()
+    scewin_runner: Optional[SCEWINRunner] = None
+    pending_scewin_action: Optional[str] = None
+    pending_scewin_path: Optional[Path] = None
+    pending_scewin_baseline: Optional[Path] = None
+    closing: bool = False
 
 
 state = GUIState()
@@ -132,26 +129,10 @@ def extract_options(body: str) -> List[OptionEntry]:
     return options
 
 
-def _selected_option_display(body: str) -> Optional[str]:
-    for line in body.splitlines():
-        opt_match = OPTION_LINE_PATTERN.match(line)
-        if opt_match and opt_match.group("star"):
-            code = opt_match.group("code")
-            label = INLINE_COMMENT_PATTERN.split(opt_match.group("label"), maxsplit=1)[0].strip()
-            return f"*[{code}]{label}"
-    return None
-
-
 def _describe_block_setting(block: Optional[QuestionBlock]) -> str:
     if block is None:
         return "<unknown>"
-    value_match = VALUE_PATTERN.search(block.body)
-    if value_match:
-        return f"Value <{value_match.group('value')}>"
-    option = _selected_option_display(block.body)
-    if option:
-        return f"Selected {option}"
-    return "No selection"
+    return current_setting(block) or "No selection"
 
 
 def set_detail_header(block: QuestionBlock) -> None:
@@ -267,13 +248,15 @@ def get_filtered_indices(filter_text: str) -> List[int]:
         collapsed = text.replace("-", " ").replace("_", " ").lower()
         return " ".join(collapsed.split())
 
+    # Commented-out questions are inactive variants, not settings: never list them.
+    active_indices = [idx for idx, block in enumerate(state.blocks) if not block.is_commented]
     normalized_filter = _normalize(filter_text)
     if not normalized_filter:
-        return list(range(len(state.blocks)))
+        return active_indices
 
     words = normalized_filter.split()
     normalized_names = [_normalize(block.name) for block in state.blocks]
-    matching_indices: Set[int] = set(range(len(state.blocks)))
+    matching_indices: Set[int] = set(active_indices)
 
     for word in words:
         word_matches = {idx for idx, name in enumerate(normalized_names) if word in name}
@@ -298,7 +281,10 @@ def rebuild_controls(block_index: int, block: QuestionBlock) -> None:
     value_match = VALUE_PATTERN.search(block.body)
     if value_match:
         current_value_text = value_match.group("value")
-        use_numeric_input = current_value_text.isdigit()
+        low, high = block.value_bounds()
+        # Dear PyGui's integer widget is 32-bit signed; wider settings use the text field.
+        fits_int32 = (high is None or high <= INT32_MAX) and (low is None or low >= 0)
+        use_numeric_input = current_value_text.isdigit() and fits_int32
 
         with dpg.group(parent="control_region", horizontal=True):
             if use_numeric_input:
@@ -306,7 +292,10 @@ def rebuild_controls(block_index: int, block: QuestionBlock) -> None:
                 dpg.add_input_int(
                     tag=input_tag,
                     label="Value",
-                    min_value=0,
+                    min_value=low if low is not None else 0,
+                    max_value=high if high is not None else INT32_MAX,
+                    min_clamped=True,
+                    max_clamped=True,
                     default_value=int(current_value_text),
                     width=180,
                 )
@@ -326,6 +315,9 @@ def rebuild_controls(block_index: int, block: QuestionBlock) -> None:
                 callback=on_value_change,
                 user_data={"block_index": block_index, "input_tag": input_tag},
             )
+        if low is not None or high is not None:
+            size = f" ({block.width}-byte setting)" if block.width else ""
+            dpg.add_text(f"Allowed range: {low} to {high}{size}.", parent="control_region", tag="value_range_hint")
         dpg.add_text(
             "Enter decimal values or 0x-prefixed hexadecimal when using the text field.",
             parent="control_region",
@@ -538,10 +530,6 @@ def update_detail_wraps() -> None:
         dpg.configure_item("question_token", wrap=wrap_width)
     if dpg.does_item_exist("help_text"):
         dpg.configure_item("help_text", width=wrap_width)
-    if dpg.does_item_exist("bypass_crc_warning"):
-        dpg.configure_item("bypass_crc_warning", wrap=wrap_width)
-    if dpg.does_item_exist("unsafe_crc_warning"):
-        dpg.configure_item("unsafe_crc_warning", wrap=wrap_width)
     if dpg.does_item_exist("control_region"):
         dpg.configure_item("control_region", width=content_width)
     if dpg.does_item_exist("sidebar"):
@@ -687,7 +675,6 @@ def on_batch_option_apply(sender: int, app_data: object, user_data: Optional[Dic
         action="option",
         option_match_value=str(option_label).strip(),
         option_display=str(option_label).strip(),
-        is_batch=True,
     )
     handle_change_request(pending)
 
@@ -707,11 +694,9 @@ def parse_numeric_input(block: QuestionBlock, raw_value: Union[str, int]) -> Tup
         except ValueError as exc:
             return None, str(exc)
 
-    if block.min_value is not None and parsed_value < block.min_value:
-        return None, _range_error_message(block.min_value, block.max_value)
-
-    if block.max_value is not None and parsed_value > block.max_value:
-        return None, _range_error_message(block.min_value, block.max_value)
+    low, high = block.value_bounds()
+    if (low is not None and parsed_value < low) or (high is not None and parsed_value > high):
+        return None, _range_error_message(low, high)
 
     return parsed_value, conversion_note
 
@@ -759,17 +744,56 @@ def on_batch_value_apply(sender: int, app_data: object, user_data: Optional[Dict
         action="value",
         new_value=parsed_value,
         conversion_note=conversion_note,
-        is_batch=True,
     )
     handle_change_request(pending)
 
 
 def _range_error_message(min_value: Optional[int], max_value: Optional[int]) -> str:
-    return f"Value out of range (Min: {min_value}, Max: {max_value})"
+    return f"Value out of range (allowed {min_value} to {max_value})"
 
 
 def handle_change_request(change: "PendingChange") -> None:
+    risky = find_risky_blocks(state.blocks[idx] for idx in change.block_indices)
+    if not risky:
+        apply_pending_change(change)
+        return
+    if nvram_settings.expert_mode():
+        names = ", ".join(block.name for block, _ in risky[:3])
+        append_log(f"Expert mode: applied without a risk prompt ({len(risky)} confirm-level question(s): {names}).")
+        apply_pending_change(change)
+        return
+
+    state.pending_change = change
+    lines = [
+        "These questions touch settings that can leave the machine unbootable or without",
+        "input/display if set wrong. Make sure you have a way to clear CMOS before importing.",
+        "",
+    ]
+    for block, keywords in risky[:15]:
+        lines.append(f"- {block.name} [{', '.join(keywords)}]")
+    if len(risky) > 15:
+        lines.append(f"...and {len(risky) - 15} more.")
+    dpg.set_value("risk_confirm_text", "\n".join(lines))
+    dpg.configure_item("risk_confirm_modal", show=True)
+    append_log(f"Risky change requested for {len(risky)} question(s); waiting for confirmation.")
+
+
+def on_risk_confirm(sender: int, app_data: object) -> None:
+    dpg.configure_item("risk_confirm_modal", show=False)
+    change = state.pending_change
+    state.pending_change = None
+    if change is None:
+        return
+    append_log("Risky change confirmed by user.")
     apply_pending_change(change)
+
+
+def on_risk_cancel(sender: int, app_data: object) -> None:
+    dpg.configure_item("risk_confirm_modal", show=False)
+    state.pending_change = None
+    append_log("Risky change cancelled; nothing was modified.")
+    # Rebuild the controls so the radio button snaps back to the real current option.
+    render_selection()
 
 
 def apply_pending_change(change: "PendingChange") -> None:
@@ -839,73 +863,6 @@ def on_value_change(sender: int, app_data: object, user_data: Dict[str, object])
     handle_change_request(pending)
 
 
-def on_toggle_bypass_crc(sender: int, app_data: object) -> None:
-    bypass_active = bool(app_data)
-    if dpg.does_item_exist("bypass_crc_mode_selector"):
-        dpg.configure_item("bypass_crc_mode_selector", enabled=bypass_active)
-
-    if bypass_active:
-        append_log("CRC bypass enabled: output will not carry a validated checksum.")
-    _update_crc_warning_state()
-
-
-def on_force_crc_toggle(sender: int, app_data: object) -> None:
-    force_enabled = bool(app_data)
-    mode = _selected_bypass_mode()
-    unsafe_mode = _is_unsafe_crc_mode(mode)
-    has_crc = getattr(state.manager, "has_crc_marker", False)
-
-    if not force_enabled:
-        return
-
-    if unsafe_mode and has_crc:
-        dpg.set_value(
-            "force_crc_warning_text",
-            "Force override enabled with unsafe CRC mode. Removing/emptying HIICrc32 on files that contain a CRC "
-            "header can render firmware images unusable. Proceed only if you have recovery media.",
-        )
-        dpg.configure_item("force_crc_modal", show=True)
-    elif unsafe_mode:
-        append_log("Force override enabled while using unsafe CRC mode on a file without detectable CRC header.")
-
-
-def on_crc_mode_change(sender: int, app_data: object) -> None:
-    mode = _selected_bypass_mode()
-    if _is_unsafe_crc_mode(mode):
-        append_log(
-            "Unsafe CRC bypass selected: removing or emptying the HIICrc32 header may make the file unusable."
-        )
-    _update_crc_warning_state()
-
-
-def _selected_bypass_mode() -> str:
-    if dpg.does_item_exist("bypass_crc_mode_selector"):
-        label = str(dpg.get_value("bypass_crc_mode_selector"))
-        return BYPASS_MODE_LABELS.get(label, "empty")
-    return "empty"
-
-
-def _is_unsafe_crc_mode(mode: str) -> bool:
-    return mode in {"remove", "empty"}
-
-
-def _update_crc_warning_state() -> None:
-    bypass_active = bool(dpg.get_value("bypass_crc_checkbox")) if dpg.does_item_exist("bypass_crc_checkbox") else False
-    mode = _selected_bypass_mode()
-    unsafe_mode = bypass_active and _is_unsafe_crc_mode(mode)
-
-    if dpg.does_item_exist("bypass_crc_warning"):
-        dpg.configure_item("bypass_crc_warning", show=bypass_active)
-
-    if dpg.does_item_exist("unsafe_crc_warning"):
-        dpg.configure_item("unsafe_crc_warning", show=unsafe_mode)
-
-    if dpg.does_item_exist("force_crc_bypass_checkbox"):
-        dpg.configure_item("force_crc_bypass_checkbox", show=unsafe_mode)
-        if not unsafe_mode:
-            dpg.set_value("force_crc_bypass_checkbox", False)
-
-
 def on_save(sender: int, app_data: object) -> None:
     if not state.manager.path:
         append_log("No file loaded. Load a file before saving changes.")
@@ -913,20 +870,6 @@ def on_save(sender: int, app_data: object) -> None:
 
     total_changes = len(state.modified_indices)
     summary = f"You are about to modify {total_changes} option(s). Do you want to continue?"
-    bypass_crc = bool(dpg.get_value("bypass_crc_checkbox")) if dpg.does_item_exist("bypass_crc_checkbox") else False
-    bypass_crc_mode = _selected_bypass_mode()
-    force_crc_bypass = (
-        bool(dpg.get_value("force_crc_bypass_checkbox")) if dpg.does_item_exist("force_crc_bypass_checkbox") else False
-    )
-    if bypass_crc:
-        summary += "\n\nCRC bypass is enabled."
-        if _is_unsafe_crc_mode(bypass_crc_mode):
-            summary += (
-                "\nWARNING: Unsafe CRC bypass selected. Removal/empty actions will be blocked when a HIICrc32 header "
-                "is present unless force is enabled."
-            )
-            if force_crc_bypass:
-                summary += "\nForce override is ON. Proceed with caution."
 
     if state.modified_indices:
         lines = ["", "Changes to be saved:"]
@@ -955,31 +898,15 @@ def perform_save(sender: int, app_data: object) -> None:
         _hide_save_confirm_modal(sender, app_data)
         return
 
-    bypass_crc = False
-    if dpg.does_item_exist("bypass_crc_checkbox"):
-        bypass_crc = bool(dpg.get_value("bypass_crc_checkbox"))
-    bypass_crc_mode = _selected_bypass_mode()
-    force_crc_bypass = bool(dpg.get_value("force_crc_bypass_checkbox")) if dpg.does_item_exist("force_crc_bypass_checkbox") else False
-
     new_text = state.manager.rebuild_text(state.blocks)
     try:
-        state.manager.save(
-            state.manager.path,
-            new_text,
-            bypass_crc=bypass_crc,
-            bypass_crc_mode=bypass_crc_mode,
-            force_crc_bypass=force_crc_bypass,
-        )
+        state.manager.save(state.manager.path, new_text)
     except (OSError, ValueError) as exc:
         append_log(f"Unable to save changes: {exc}")
         _hide_save_confirm_modal(sender, app_data)
         return
 
     append_log(f"Changes saved to '{state.manager.path}'. Backup created with .bak extension.")
-    if bypass_crc:
-        append_log(
-            f"CRC bypass active ({bypass_crc_mode}): saved without restoring the original checksum."
-        )
     state.original_blocks = list(state.blocks)
     state.modified_indices.clear()
     if dpg.does_item_exist("search_input"):
@@ -988,15 +915,97 @@ def perform_save(sender: int, app_data: object) -> None:
     _hide_save_confirm_modal(sender, app_data)
 
 
-def on_force_crc_cancel(sender: int, app_data: object) -> None:
-    if dpg.does_item_exist("force_crc_bypass_checkbox"):
-        dpg.set_value("force_crc_bypass_checkbox", False)
-    dpg.configure_item("force_crc_modal", show=False)
+def _window_title() -> str:
+    suffix = "  [EXPERT MODE]" if nvram_settings.expert_mode() else ""
+    return f"NVRAM Tweaker {__version__}{suffix}"
 
 
-def on_force_crc_confirm(sender: int, app_data: object) -> None:
-    dpg.configure_item("force_crc_modal", show=False)
-    append_log("Force CRC override confirmed by user. Proceed with extreme caution.")
+def refresh_expert_indicator() -> None:
+    """Keep the checkbox, the window label and the title bar in step with the stored setting."""
+
+    enabled = nvram_settings.expert_mode()
+    if dpg.does_item_exist("expert_mode_checkbox"):
+        dpg.set_value("expert_mode_checkbox", enabled)
+    if dpg.does_item_exist("primary_window"):
+        dpg.configure_item("primary_window", label=_window_title())
+    try:
+        dpg.set_viewport_title(_window_title())
+    except Exception:  # no viewport yet (or a headless test)
+        pass
+
+
+def on_expert_toggle(sender: int, app_data: object) -> None:
+    if app_data:
+        # Turning it on needs the acknowledgement: undo the tick until it is given.
+        dpg.set_value("expert_mode_checkbox", False)
+        dpg.set_value("expert_ack", False)
+        dpg.configure_item("expert_confirm_modal", show=True)
+        return
+    try:
+        nvram_settings.set_expert_mode(False)
+    except OSError as exc:
+        append_log(f"Could not save the setting: {exc}")
+    refresh_expert_indicator()
+    append_log("Expert mode is off.")
+
+
+def on_expert_cancel(sender: int, app_data: object) -> None:
+    dpg.configure_item("expert_confirm_modal", show=False)
+    refresh_expert_indicator()
+
+
+def on_expert_confirm(sender: int, app_data: object) -> None:
+    if not dpg.get_value("expert_ack"):
+        append_log("Tick the acknowledgement to turn expert mode on.")
+        return
+    dpg.configure_item("expert_confirm_modal", show=False)
+    try:
+        nvram_settings.set_expert_mode(True, acknowledged=True)
+    except OSError as exc:
+        append_log(f"Could not save the setting: {exc}")
+        show_message("Expert mode not saved", f"The setting could not be written:\n{exc}")
+    else:
+        append_log("Expert mode is on: risky settings no longer ask for confirmation.")
+    refresh_expert_indicator()
+
+
+def _quit() -> None:
+    # The exit callback also fires on the last frame; the flag keeps it from re-prompting.
+    state.closing = True
+    dpg.stop_dearpygui()
+
+
+def on_close_requested() -> None:
+    """Called when the window's close button is pressed (the viewport is created with disable_close)."""
+
+    if state.closing:
+        return
+    if not state.modified_indices:
+        _quit()
+        return
+    dpg.set_value(
+        "close_confirm_text",
+        f"You have {len(state.modified_indices)} unsaved change(s). Closing now discards them.",
+    )
+    dpg.configure_item("close_confirm_modal", show=True)
+
+
+def on_close_cancel(sender: int, app_data: object) -> None:
+    dpg.configure_item("close_confirm_modal", show=False)
+
+
+def on_close_discard(sender: int, app_data: object) -> None:
+    dpg.configure_item("close_confirm_modal", show=False)
+    _quit()
+
+
+def on_close_save(sender: int, app_data: object) -> None:
+    dpg.configure_item("close_confirm_modal", show=False)
+    perform_save(sender, app_data)
+    if state.modified_indices:  # the save failed; perform_save logged why
+        append_log("Not closing: the changes could not be saved.")
+        return
+    _quit()
 
 
 def on_file_selected(file_path: Union[str, Path]) -> None:
@@ -1027,20 +1036,15 @@ def on_file_selected(file_path: Union[str, Path]) -> None:
     if dpg.does_item_exist("search_input"):
         dpg.set_value("search_input", "")
     block_count = len(state.blocks)
-    label_text = f"Loaded: {resolved_path.name} ({block_count} blocks)"
-    if block_count == 0:
-        label_text = f"Loaded: {resolved_path.name} (no questions detected)"
-    dpg.set_value("loaded_file_label", label_text)
-    block_count = len(state.blocks)
-    append_log(f"Successfully loaded {block_count} block(s).")
-    append_log(f"Scan complete: found {block_count} total blocks.")
-    append_log(f"Load complete. Total blocks: {block_count}")
     if block_count:
-        append_log(f"Validated file: {block_count} configuration blocks found.")
-        append_log(f"Loaded file: {resolved_path}")
+        dpg.set_value("loaded_file_label", f"Loaded: {resolved_path.name} ({block_count} blocks)")
+        append_log(f"Loaded {resolved_path}: {block_count} question(s).")
     else:
-        append_log("ERROR: No Setup Question blocks detected. Verify the file format.")
-        append_log("CRITICAL: No Setup Question blocks detected. Confirm this is a valid AMISCE export.")
+        dpg.set_value("loaded_file_label", f"Loaded: {resolved_path.name} (no questions detected)")
+        append_log(
+            f"ERROR: No Setup Question blocks detected in {resolved_path}. "
+            "Confirm this is a valid AMISCE export."
+        )
     update_question_list("")
     if state.blocks:
         first_index = 0
@@ -1050,8 +1054,6 @@ def on_file_selected(file_path: Union[str, Path]) -> None:
         if dpg.does_item_exist(selectable_tag):
             dpg.set_value(selectable_tag, True)
         on_question_selected(None, None, {"index": first_index, "tag": selectable_tag})
-    else:
-        dpg.set_value("loaded_file_label", f"Loaded: {resolved_path.name} (no questions detected)")
 
 
 def _dialog_start_path() -> str:
@@ -1064,6 +1066,12 @@ def _dialog_start_path() -> str:
 
 
 def open_file_dialog() -> None:
+    if state.modified_indices:
+        show_message(
+            "Unsaved changes",
+            "Opening another file would discard your unsaved changes. Save them first.",
+        )
+        return
     root = Tk()
     root.withdraw()
     try:
@@ -1076,6 +1084,229 @@ def open_file_dialog() -> None:
         return
 
     on_file_selected(file_path)
+
+
+def _set_scewin_runner(directory: Path) -> bool:
+    try:
+        state.scewin_runner = SCEWINRunner(directory)
+    except SCEWINError as exc:
+        append_log(str(exc))
+        return False
+    if dpg.does_item_exist("scewin_dir_label"):
+        dpg.set_value("scewin_dir_label", f"SCEWIN: {state.scewin_runner.scewin_dir}")
+    append_log(f"Using SCEWIN from {state.scewin_runner.scewin_dir}.")
+    return True
+
+
+def detect_scewin_dir() -> None:
+    found = guess_scewin_dir(default_scewin_candidates())
+    if found is not None:
+        _set_scewin_runner(found)
+
+
+def on_choose_scewin_dir(sender: int, app_data: object) -> None:
+    root = Tk()
+    root.withdraw()
+    try:
+        chosen = filedialog.askdirectory(
+            title="Select the folder containing SCEWIN_64.exe", initialdir=_dialog_start_path()
+        )
+    finally:
+        root.destroy()
+    if chosen:
+        _set_scewin_runner(Path(chosen))
+
+
+def _require_scewin() -> Optional[SCEWINRunner]:
+    if state.scewin_runner is None:
+        append_log(
+            "No SCEWIN folder selected. Click 'Choose SCEWIN folder' and pick the folder with SCEWIN_64.exe "
+            "(get it with SCEHUB's DL_SCEWIN.exe: https://github.com/ab3lkaizen/SCEHUB)."
+        )
+    return state.scewin_runner
+
+
+def _default_script_path() -> Path:
+    if state.manager.path:
+        return Path(state.manager.path)
+    if state.scewin_runner is not None:
+        return state.scewin_runner.scewin_dir / DEFAULT_SCRIPT_NAME
+    return Path.cwd() / DEFAULT_SCRIPT_NAME
+
+
+def _report_scewin_result(result: SCEWINResult) -> None:
+    lines = result.summary_lines()
+    for line in lines:
+        append_log(line)
+    if not result.ok:
+        show_message("SCEWIN reported a problem", "\n".join(lines))
+
+
+def show_message(title: str, text: str) -> None:
+    dpg.set_value("message_title", title)
+    dpg.set_value("message_text", text)
+    dpg.configure_item("message_modal", show=True)
+
+
+def on_scewin_export(sender: int, app_data: object) -> None:
+    runner = _require_scewin()
+    if runner is None:
+        return
+    if state.modified_indices:
+        show_message(
+            "Unsaved changes",
+            "Exporting would overwrite the editor's view of the file. Save or discard your changes first.",
+        )
+        return
+
+    default_path = _default_script_path()
+    root = Tk()
+    root.withdraw()
+    try:
+        chosen = filedialog.asksaveasfilename(
+            title="Export NVRAM settings to",
+            initialdir=str(default_path.parent),
+            initialfile=default_path.name,
+            defaultextension=".txt",
+            filetypes=[("NVRAM script", "*.txt"), ("All files", "*.*")],
+        )
+    finally:
+        root.destroy()
+    if not chosen:
+        append_log("Export cancelled.")
+        return
+
+    script_path = Path(chosen)
+    append_log(f"Running SCEWIN export to {script_path} ...")
+    try:
+        result = runner.export(script_path)
+    except SCEWINError as exc:
+        append_log(str(exc))
+        show_message("Export failed", str(exc))
+        return
+    _report_scewin_result(result)
+    if result.ok and script_path.is_file():
+        on_file_selected(script_path)
+
+
+def _open_scewin_confirm(action: str, script_path: Path) -> None:
+    runner = state.scewin_runner
+    assert runner is not None
+
+    baseline: Optional[Path] = None
+    if action == "import":
+        # Read the live BIOS first (read-only): the preview and the checks then compare against
+        # what the BIOS holds now, and the snapshot is the undo for this import.
+        append_log("Reading the current BIOS settings to compare against ...")
+        try:
+            baseline = runner.snapshot(script_path)
+        except SCEWINError as exc:
+            append_log(str(exc))
+            show_message("Import blocked", str(exc))
+            return
+    else:
+        baseline = script_path  # the restore point is its own baseline: there is nothing to diff
+
+    issues = runner.check_import(script_path, baseline)
+    if issues:
+        text = "Import blocked by preflight checks:\n- " + "\n- ".join(issues)
+        append_log(text)
+        show_message("Import blocked", text)
+        return
+
+    if action == "restore":
+        lines = [
+            f"Re-import the original export:\n{script_path}",
+            "",
+            "This puts every setting back to how it was when you first exported.",
+        ]
+        risky = False
+    else:
+        changes = runner.changes_since_export(script_path, baseline)
+        lines = [f"Write this file to NVRAM:\n{script_path}", ""]
+        if changes is None:
+            lines.append("No restore point exists for this file, so the changes cannot be listed.")
+            lines.append("Export from BIOS first so you have a way back.")
+            risky = False
+        elif not changes:
+            lines.append("No settings differ from the restore point.")
+            risky = False
+        else:
+            lines.append(f"{len(changes)} setting(s) differ from the restore point:")
+            lines.extend(f"- {change.format()}" for change in changes[:25])
+            if len(changes) > 25:
+                lines.append(f"...and {len(changes) - 25} more.")
+            # The risky changes stay listed with their [RISK] tags; expert mode only drops the extra tick box.
+            risky = any(change.risk_keywords for change in changes) and not nvram_settings.expert_mode()
+    lines += ["", "Changes take effect after a reboot."]
+
+    state.pending_scewin_action = action
+    state.pending_scewin_path = script_path
+    state.pending_scewin_baseline = baseline
+    dpg.set_value("scewin_confirm_text", "\n".join(lines))
+    dpg.set_value("scewin_risk_ack", False)
+    dpg.configure_item("scewin_risk_ack", show=risky)
+    dpg.configure_item("scewin_confirm_modal", show=True)
+    if action == "import" and baseline is not None:
+        append_log(f"Compared against the live BIOS ({baseline.name}); it is also your undo for this import.")
+
+
+def on_scewin_import(sender: int, app_data: object) -> None:
+    if _require_scewin() is None:
+        return
+    if not state.manager.path:
+        append_log("Load or export an NVRAM file before importing.")
+        return
+    if state.modified_indices:
+        show_message("Unsaved changes", "Save your changes before importing; SCEWIN reads the file on disk.")
+        return
+    _open_scewin_confirm("import", Path(state.manager.path))
+
+
+def on_scewin_restore(sender: int, app_data: object) -> None:
+    if _require_scewin() is None:
+        return
+    restore_point = restore_point_path(_default_script_path().resolve())
+    if not restore_point.is_file():
+        show_message("No restore point", f"No restore point at:\n{restore_point}\nIt is created by the first export.")
+        return
+    _open_scewin_confirm("restore", restore_point)
+
+
+def on_scewin_cancel(sender: int, app_data: object) -> None:
+    dpg.configure_item("scewin_confirm_modal", show=False)
+    state.pending_scewin_action = None
+    state.pending_scewin_path = None
+    state.pending_scewin_baseline = None
+    append_log("SCEWIN import cancelled; NVRAM was not touched.")
+
+
+def on_scewin_confirm(sender: int, app_data: object) -> None:
+    runner = state.scewin_runner
+    action = state.pending_scewin_action
+    script_path = state.pending_scewin_path
+    baseline = state.pending_scewin_baseline
+    if runner is None or action is None or script_path is None:
+        dpg.configure_item("scewin_confirm_modal", show=False)
+        return
+    if dpg.get_item_configuration("scewin_risk_ack").get("show") and not dpg.get_value("scewin_risk_ack"):
+        append_log("Tick the risk acknowledgement before writing risky settings to NVRAM.")
+        return
+
+    dpg.configure_item("scewin_confirm_modal", show=False)
+    state.pending_scewin_action = None
+    state.pending_scewin_path = None
+    state.pending_scewin_baseline = None
+    append_log(f"Running SCEWIN {action} from {script_path} ...")
+    try:
+        result = replace(runner.import_script(script_path, baseline=baseline), action=action)
+    except SCEWINError as exc:
+        append_log(str(exc))
+        show_message(f"{action.capitalize()} failed", str(exc))
+        return
+    _report_scewin_result(result)
+    if result.ok:
+        append_log("Reboot for the new NVRAM settings to take effect.")
 
 
 def apply_dark_theme() -> None:
@@ -1133,7 +1364,7 @@ def build_ui() -> None:
     apply_dark_theme()
     layout = _calculate_layout_metrics()
 
-    with dpg.window(tag="primary_window", label="NVRAM Tweaker - Dear PyGui", width=1200, height=820):
+    with dpg.window(tag="primary_window", label=_window_title(), width=1200, height=820):
         dpg.add_spacer(height=8)
 
         with dpg.group(horizontal=True, horizontal_spacing=8):
@@ -1141,6 +1372,26 @@ def build_ui() -> None:
                 dpg.add_text("Setup Questions")
                 dpg.add_text("No file loaded", tag="loaded_file_label", color=(180, 180, 200))
                 dpg.add_button(label="Open NVRAM file", callback=lambda: open_file_dialog())
+                with dpg.collapsing_header(label="SCEWIN: read / write BIOS", default_open=True):
+                    dpg.add_text("SCEWIN: not selected", tag="scewin_dir_label", color=(180, 180, 200), wrap=300)
+                    dpg.add_button(label="Choose SCEWIN folder", callback=on_choose_scewin_dir)
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(label="Export from BIOS", callback=on_scewin_export)
+                        dpg.add_button(label="Import to BIOS", callback=on_scewin_import)
+                    dpg.add_button(label="Restore original", tag="scewin_restore_button", callback=on_scewin_restore)
+                    with dpg.tooltip(parent="scewin_restore_button"):
+                        dpg.add_text("Re-imports the untouched copy saved by your first export.")
+                dpg.add_checkbox(
+                    tag="expert_mode_checkbox",
+                    label="Expert mode (skip risk prompts)",
+                    default_value=nvram_settings.expert_mode(),
+                    callback=on_expert_toggle,
+                )
+                with dpg.tooltip(parent="expert_mode_checkbox"):
+                    dpg.add_text(
+                        "Stops asking before you change risky settings. The change list, the integrity "
+                        "checks and the final write question stay."
+                    )
                 dpg.add_input_text(
                     tag="search_input",
                     label="Search",
@@ -1200,47 +1451,6 @@ def build_ui() -> None:
                         horizontal_scrollbar=True,
                     )
                     dpg.add_separator()
-                    dpg.add_checkbox(
-                        tag="bypass_crc_checkbox",
-                        label="Bypass CRC handling",
-                        default_value=False,
-                        indent=6,
-                        callback=on_toggle_bypass_crc,
-                    )
-                    with dpg.tooltip(parent="bypass_crc_checkbox"):
-                        dpg.add_text("Saves without restoring the original CRC value.")
-                    dpg.add_text(
-                        "Warning: bypassing CRC may render the file incompatible with strict firmware loaders.",
-                        tag="bypass_crc_warning",
-                        color=(255, 180, 120),
-                        indent=10,
-                        wrap=layout["wrap_width"],
-                        show=False,
-                    )
-                    dpg.add_text(
-                        "Unsafe: removing or emptying HIICrc32 will be blocked when a CRC header is present unless forced.",
-                        tag="unsafe_crc_warning",
-                        color=(255, 150, 150),
-                        indent=12,
-                        wrap=layout["wrap_width"],
-                        show=False,
-                    )
-                    dpg.add_radio_button(
-                        tag="bypass_crc_mode_selector",
-                        items=list(BYPASS_MODE_LABELS.keys()),
-                        default_value="Version placeholder",
-                        indent=12,
-                        horizontal=True,
-                        callback=on_crc_mode_change,
-                    )
-                    dpg.configure_item("bypass_crc_mode_selector", enabled=False)
-                    dpg.add_checkbox(
-                        tag="force_crc_bypass_checkbox",
-                        label="Force unsafe CRC change (expert only)",
-                        indent=12,
-                        show=False,
-                        callback=on_force_crc_toggle,
-                    )
                     dpg.add_button(label="Save changes", callback=on_save, indent=6)
 
         with dpg.child_window(tag="console_panel", height=layout["console_panel_height"], autosize_x=True, border=True):
@@ -1277,23 +1487,65 @@ def build_ui() -> None:
         dpg.add_text("", tag="load_error_text", wrap=480)
         dpg.add_button(label="Close", callback=lambda sender, app_data: dpg.configure_item("load_error_modal", show=False))
 
-    with dpg.window(tag="force_crc_modal", modal=True, show=False, no_move=True, no_close=True, no_resize=True):
-        dpg.add_text("Confirm Force CRC Override")
+    with dpg.window(tag="risk_confirm_modal", modal=True, show=False, no_move=True, no_close=True, no_resize=True):
+        dpg.add_text("Confirm risky change", color=(255, 170, 120))
         dpg.add_separator()
-        dpg.add_text("", tag="force_crc_warning_text", wrap=500)
+        dpg.add_text("", tag="risk_confirm_text", wrap=520)
         with dpg.group(horizontal=True):
-            dpg.add_button(label="Cancel", callback=on_force_crc_cancel)
-            dpg.add_button(label="Proceed anyway", callback=on_force_crc_confirm)
+            dpg.add_button(label="Cancel", callback=on_risk_cancel)
+            dpg.add_button(label="Apply anyway", callback=on_risk_confirm)
 
-    dpg.create_viewport(title="NVRAM Tweaker UI", width=1200, height=840, resizable=True)
+    with dpg.window(tag="scewin_confirm_modal", modal=True, show=False, no_move=True, no_close=True, no_resize=True):
+        dpg.add_text("Write settings to NVRAM", color=(255, 170, 120))
+        dpg.add_separator()
+        dpg.add_text("", tag="scewin_confirm_text", wrap=620)
+        dpg.add_checkbox(
+            tag="scewin_risk_ack",
+            label="I understand some of these settings can stop the machine from booting, and I can clear CMOS.",
+            show=False,
+        )
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Cancel", callback=on_scewin_cancel)
+            dpg.add_button(label="Write to NVRAM", callback=on_scewin_confirm)
+
+    with dpg.window(tag="expert_confirm_modal", modal=True, show=False, no_move=True, no_close=True, no_resize=True):
+        dpg.add_text("Turn on expert mode", color=(255, 170, 120))
+        dpg.add_separator()
+        dpg.add_text(
+            "Risky settings (voltages, power limits, XHCI, CSM, Secure Boot, TPM, ...) will no longer "
+            "ask for confirmation. You still see the change list, and the final write still asks.",
+            wrap=520,
+        )
+        dpg.add_checkbox(tag="expert_ack", label="I understand this can brick my machine and I know how to clear CMOS.")
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Cancel", callback=on_expert_cancel)
+            dpg.add_button(label="Turn on expert mode", callback=on_expert_confirm)
+
+    with dpg.window(tag="message_modal", modal=True, show=False, no_move=True, no_resize=True):
+        dpg.add_text("", tag="message_title")
+        dpg.add_separator()
+        dpg.add_text("", tag="message_text", wrap=560)
+        dpg.add_button(label="Close", callback=lambda sender, app_data: dpg.configure_item("message_modal", show=False))
+
+    with dpg.window(tag="close_confirm_modal", modal=True, show=False, no_move=True, no_close=True, no_resize=True):
+        dpg.add_text("Unsaved changes", color=(255, 170, 120))
+        dpg.add_separator()
+        dpg.add_text("", tag="close_confirm_text", wrap=420)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Cancel", callback=on_close_cancel)
+            dpg.add_button(label="Discard and close", callback=on_close_discard)
+            dpg.add_button(label="Save and close", callback=on_close_save)
+
+    dpg.create_viewport(title=_window_title(), width=1200, height=840, resizable=True, disable_close=True)
+    dpg.set_exit_callback(on_close_requested)
     dpg.setup_dearpygui()
     dpg.show_viewport()
     update_detail_wraps()
-    _update_crc_warning_state()
     if hasattr(dpg, "set_viewport_resize_callback"):
         dpg.set_viewport_resize_callback(on_viewport_resize)
     dpg.set_primary_window("primary_window", True)
-    append_log("Ready. Load an NVRAM file to start.")
+    append_log("Ready. Load an NVRAM file, or export one from the BIOS with SCEWIN.")
+    detect_scewin_dir()
     dpg.start_dearpygui()
     dpg.destroy_context()
 
