@@ -16,7 +16,7 @@ dpg = pytest.importorskip("dearpygui.dearpygui")
 
 import nvram_gui  # noqa: E402
 import scewin_runner  # noqa: E402
-from test_scewin_integration import FakeRun  # noqa: E402
+from test_scewin_integration import SAMPLE_EXPORT, FakeRun, LiveBiosRun  # noqa: E402
 
 FIXTURE = Path(__file__).parent / "tests" / "fixtures" / "real_export_trimmed.txt"
 
@@ -241,7 +241,7 @@ def test_export_edit_import_restore_flow(gui, tmp_path, monkeypatch) -> None:
     for name in scewin_runner.REQUIRED_FILES:
         (scewin_dir / name).write_bytes(b"")
     script = tmp_path / "nvram.txt"
-    run = FakeRun()
+    run = LiveBiosRun(SAMPLE_EXPORT)
     gui.state.scewin_runner = scewin_runner.SCEWINRunner(scewin_dir, run=run, admin_check=lambda: True)
     monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(script))
 
@@ -271,10 +271,40 @@ def test_export_edit_import_restore_flow(gui, tmp_path, monkeypatch) -> None:
     gui.on_scewin_confirm(None, None)
     assert run.calls[-1][1:] == ["/i", "/s", str(script.resolve())]
 
+    # The restore goes through the same gate: the BIOS is read first, the settings that
+    # will be put back are listed, and a risky one needs the acknowledgement.
+    run.live_text = script.read_text(encoding="utf-8")  # the BIOS now holds what was imported
     gui.on_scewin_restore(None, None)
+    assert run.calls[-1][1] == "/o"
+    assert shown("scewin_confirm_modal") and "XHCI Hand-off" in dpg.get_value("scewin_confirm_text")
+    assert "will be put back" in dpg.get_value("scewin_confirm_text")
+    assert shown("scewin_risk_ack")
+    calls = len(run.calls)
+    gui.on_scewin_confirm(None, None)  # acknowledgement not ticked
+    assert len(run.calls) == calls
+    dpg.set_value("scewin_risk_ack", True)
     gui.on_scewin_confirm(None, None)
     assert run.calls[-1][1:] == ["/i", "/s", str((tmp_path / "nvram.original.txt").resolve())]
     assert any("SCEWIN restore succeeded" in m for m in gui.state.log_messages)
+
+
+def test_restore_is_blocked_in_the_gui_when_the_bios_version_changed(gui, tmp_path, monkeypatch) -> None:
+    scewin_dir = tmp_path / "SCEWIN"
+    scewin_dir.mkdir()
+    for name in scewin_runner.REQUIRED_FILES:
+        (scewin_dir / name).write_bytes(b"")
+    script = tmp_path / "nvram.txt"
+    run = LiveBiosRun(SAMPLE_EXPORT)
+    gui.state.scewin_runner = scewin_runner.SCEWINRunner(scewin_dir, run=run, admin_check=lambda: True)
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(script))
+    gui.on_scewin_export(None, None)
+
+    run.live_text = script.read_text(encoding="utf-8").replace("HIICrc32= 5B2C3F1A", "HIICrc32= 0BADF00D")
+    gui.on_scewin_restore(None, None)
+
+    assert shown("message_modal") and "different BIOS version" in dpg.get_value("message_text")
+    assert not shown("scewin_confirm_modal")
+    assert all("/i" not in call for call in run.calls)
 
 
 def test_window_title_shows_the_version(gui) -> None:

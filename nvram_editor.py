@@ -242,11 +242,9 @@ class NVRAMManager:
                 "overwriting external edits."
             )
 
-        # The first save also keeps the untouched file, so the original survives any number
-        # of later saves (the .bak only ever holds the previous version).
-        restore_point = restore_point_path(path)
-        if not path.stem.endswith(".original") and not restore_point.exists():
-            shutil.copyfile(path, restore_point)
+        # The restore point (<name>.original<ext>) is deliberately not created here. It is what
+        # 'restore' writes back to the BIOS, so it only ever comes from the BIOS itself (an
+        # export or a snapshot), never from a file that may already have been edited.
         # A byte-for-byte copy: re-encoding or newline translation would alter the backup.
         shutil.copyfile(path, path.with_name(path.name + ".bak"))
 

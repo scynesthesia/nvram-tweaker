@@ -277,9 +277,49 @@ def test_restore_imports_the_restore_point(tmp_path: Path, scewin_dir: Path) -> 
         ("Fan Start Temperature", "Value <30>", "Value <45>")
     ]
 
-    result = runner.restore(script)
+    baseline = runner.snapshot(script)
+    result = runner.restore(script, baseline)
     assert result.action == "restore"
     assert run.calls[-1][1:] == ["/i", "/s", str((tmp_path / "nvram.original.txt").resolve())]
+
+
+def test_restore_is_refused_without_a_snapshot_to_compare_against(tmp_path: Path, scewin_dir: Path) -> None:
+    run = FakeRun()
+    runner = make_runner(scewin_dir, run)
+    script = tmp_path / "nvram.txt"
+    runner.export(script)
+
+    with pytest.raises(scewin_runner.SCEWINError, match="only be compared with itself"):
+        runner.restore(script)
+    assert all("/i" not in call for call in run.calls)
+
+    assert runner.restore(script, allow_unchecked=True).ok  # the explicit emergency path
+    assert run.calls[-1][1] == "/i"
+
+
+def test_a_file_is_never_its_own_baseline(tmp_path: Path, scewin_dir: Path) -> None:
+    runner = make_runner(scewin_dir, FakeRun())
+    script = tmp_path / "nvram.txt"
+    runner.export(script)
+    assert any("compared with itself" in issue for issue in runner.check_import(script, script))
+
+
+def test_restore_allows_questions_the_bios_hides_right_now(tmp_path: Path, scewin_dir: Path) -> None:
+    """Which questions are active can depend on other settings; an untouched restore point is still valid."""
+
+    script = tmp_path / "nvram.txt"
+    make_runner(scewin_dir, FakeRun()).export(script)
+    hidden_now = SAMPLE_EXPORT.replace(
+        "Setup Question\t= Fan Start Temperature", "// Setup Question\t= Fan Start Temperature"
+    ).replace("BIOS Default =<30>\nValue\t=<30>", "// BIOS Default =<30>\n// Value\t=<30>")
+    runner = make_runner(scewin_dir, LiveBiosRun(hidden_now))
+    baseline = runner.snapshot(script)
+    restore_point = tmp_path / "nvram.original.txt"
+
+    assert runner.check_import(restore_point, baseline, role="restore") == []
+    assert any("was not an active question" in issue for issue in runner.check_import(restore_point, baseline))
+    changes = runner.changes_since_export(restore_point, baseline)
+    assert [(c.name, c.before, c.after) for c in changes] == [("Fan Start Temperature", None, "Value <30>")]
 
 
 def test_restore_without_restore_point_fails(tmp_path: Path, scewin_dir: Path) -> None:

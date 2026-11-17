@@ -1205,55 +1205,63 @@ def on_scewin_export(sender: int, app_data: object) -> None:
         on_file_selected(script_path)
 
 
-def _open_scewin_confirm(action: str, script_path: Path) -> None:
+def _open_scewin_confirm(action: str, script_path: Path, snapshot_for: Optional[Path] = None) -> None:
+    """Check ``script_path`` against the live BIOS and ask before writing it.
+
+    A restore goes through exactly the same gate as an import: it writes to the BIOS too.
+    ``snapshot_for`` is the working file the snapshot is named after (for a restore, the
+    script the restore point belongs to); it defaults to ``script_path``.
+    """
+
     runner = state.scewin_runner
     assert runner is not None
+    title = f"{action.capitalize()} blocked"
 
-    baseline: Optional[Path] = None
-    if action == "import":
-        # Read the live BIOS first (read-only): the preview and the checks then compare against
-        # what the BIOS holds now, and the snapshot is the undo for this import.
-        append_log("Reading the current BIOS settings to compare against ...")
-        try:
-            baseline = runner.snapshot(script_path)
-        except SCEWINError as exc:
-            append_log(str(exc))
-            show_message("Import blocked", str(exc))
-            return
-    else:
-        baseline = script_path  # the restore point is its own baseline: there is nothing to diff
-
-    issues = runner.check_import(script_path, baseline)
-    if issues:
-        text = "Import blocked by preflight checks:\n- " + "\n- ".join(issues)
-        append_log(text)
-        show_message("Import blocked", text)
+    # Read the live BIOS first (read-only): the preview and the checks then compare against
+    # what the BIOS holds now, and the snapshot is the undo for this write.
+    append_log("Reading the current BIOS settings to compare against ...")
+    try:
+        baseline = runner.snapshot(snapshot_for or script_path)
+    except SCEWINError as exc:
+        append_log(str(exc))
+        show_message(title, str(exc))
         return
 
+    issues = runner.check_import(script_path, baseline, role=action)
+    if issues:
+        text = f"{title} by preflight checks:\n- " + "\n- ".join(issues)
+        append_log(text)
+        show_message(title, text)
+        return
+
+    changes = runner.changes_since_export(script_path, baseline)
     if action == "restore":
         lines = [
             f"Re-import the original export:\n{script_path}",
             "",
             "This puts every setting back to how it was when you first exported.",
+            "",
         ]
+        nothing = "The BIOS already holds these settings; nothing would change."
+        heading = "setting(s) will be put back:"
+    else:
+        lines = [f"Write this file to NVRAM:\n{script_path}", ""]
+        nothing = "No settings differ from the restore point."
+        heading = "setting(s) differ from the restore point:"
+    if changes is None:
+        lines.append("No restore point exists for this file, so the changes cannot be listed.")
+        lines.append("Export from BIOS first so you have a way back.")
+        risky = False
+    elif not changes:
+        lines.append(nothing)
         risky = False
     else:
-        changes = runner.changes_since_export(script_path, baseline)
-        lines = [f"Write this file to NVRAM:\n{script_path}", ""]
-        if changes is None:
-            lines.append("No restore point exists for this file, so the changes cannot be listed.")
-            lines.append("Export from BIOS first so you have a way back.")
-            risky = False
-        elif not changes:
-            lines.append("No settings differ from the restore point.")
-            risky = False
-        else:
-            lines.append(f"{len(changes)} setting(s) differ from the restore point:")
-            lines.extend(f"- {change.format()}" for change in changes[:25])
-            if len(changes) > 25:
-                lines.append(f"...and {len(changes) - 25} more.")
-            # The risky changes stay listed with their [RISK] tags; expert mode only drops the extra tick box.
-            risky = any(change.risk_keywords for change in changes) and not nvram_settings.expert_mode()
+        lines.append(f"{len(changes)} {heading}")
+        lines.extend(f"- {change.format()}" for change in changes[:25])
+        if len(changes) > 25:
+            lines.append(f"...and {len(changes) - 25} more.")
+        # The risky changes stay listed with their [RISK] tags; expert mode only drops the extra tick box.
+        risky = any(change.risk_keywords for change in changes) and not nvram_settings.expert_mode()
     lines += ["", "Changes take effect after a reboot."]
 
     state.pending_scewin_action = action
@@ -1263,8 +1271,7 @@ def _open_scewin_confirm(action: str, script_path: Path) -> None:
     dpg.set_value("scewin_risk_ack", False)
     dpg.configure_item("scewin_risk_ack", show=risky)
     dpg.configure_item("scewin_confirm_modal", show=True)
-    if action == "import" and baseline is not None:
-        append_log(f"Compared against the live BIOS ({baseline.name}); it is also your undo for this import.")
+    append_log(f"Compared against the live BIOS ({baseline.name}); it is also your undo for this {action}.")
 
 
 def on_scewin_import(sender: int, app_data: object) -> None:
@@ -1282,11 +1289,12 @@ def on_scewin_import(sender: int, app_data: object) -> None:
 def on_scewin_restore(sender: int, app_data: object) -> None:
     if _require_scewin() is None:
         return
-    restore_point = restore_point_path(_default_script_path().resolve())
+    working_file = _default_script_path().resolve()
+    restore_point = restore_point_path(working_file)
     if not restore_point.is_file():
         show_message("No restore point", f"No restore point at:\n{restore_point}\nIt is created by the first export.")
         return
-    _open_scewin_confirm("restore", restore_point)
+    _open_scewin_confirm("restore", restore_point, snapshot_for=working_file)
 
 
 def on_scewin_cancel(sender: int, app_data: object) -> None:
@@ -1315,7 +1323,7 @@ def on_scewin_confirm(sender: int, app_data: object) -> None:
     state.pending_scewin_baseline = None
     append_log(f"Running SCEWIN {action} from {script_path} ...")
     try:
-        result = replace(runner.import_script(script_path, baseline=baseline), action=action)
+        result = runner.import_script(script_path, baseline=baseline, role=action)
     except SCEWINError as exc:
         append_log(str(exc))
         show_message(f"{action.capitalize()} failed", str(exc))

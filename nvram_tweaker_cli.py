@@ -21,7 +21,7 @@ from typing import Callable, List, Optional, Sequence
 import nvram_settings
 import scewin_runner
 from nvram_cli_prompts import confirm_write, is_interactive
-from nvram_editor import NVRAMManager, apply_changes, restore_point_path
+from nvram_editor import NVRAMManager, apply_changes
 from nvram_parsing import has_unreadable_value, validate_numeric_input
 from nvram_safety import current_setting, diff_blocks, noted_keywords, option_text, risky_keywords
 from nvram_structures import OptionField, QuestionBlock, ValueField
@@ -285,7 +285,7 @@ def cmd_set(
         return EXIT_ERROR
 
     manager.save(args.file, manager.rebuild_text(updated))
-    print(f"Saved {args.file}. Previous version: {args.file.name}.bak. Untouched original: {restore_point_path(args.file).name}.")
+    print(f"Saved {args.file}. Previous version: {args.file.name}.bak.")
     return EXIT_OK
 
 

@@ -245,13 +245,19 @@ def _mask_line(line: str) -> str:
     return text
 
 
-def structural_changes(reference_text: str, candidate_text: str) -> List[str]:
+def structural_changes(
+    reference_text: str, candidate_text: str, *, allow_newly_active: bool = False
+) -> List[str]:
     """Describe live questions whose text differs in more than the selected option or number.
 
     Hand edits to ``Offset``, ``Width``, ``Token``, added or removed options, string values and
     so on do not show up in :func:`diff_blocks`, which only compares the current setting, yet
     SCEWIN would write them. Questions that are live in the candidate but were not live in the
-    reference (new, or un-commented) are reported too.
+    reference (new, or un-commented) are reported too, unless ``allow_newly_active`` is set.
+
+    ``allow_newly_active`` is for a restore: which questions SCEWIN exports as active can depend
+    on other settings, so an untouched restore point may hold questions the BIOS hides right
+    now. They are still listed as changes (``<none> -> ...``) by :func:`diff_blocks`.
     """
 
     reference = _keyed(find_blocks(reference_text)[0])
@@ -260,7 +266,8 @@ def structural_changes(reference_text: str, candidate_text: str) -> List[str]:
         label = f"'{block.name}' (Token {block.token or 'none'})"
         before = reference.get(key)
         if before is None:
-            problems.append(f"{label} was not an active question in the baseline")
+            if not allow_newly_active:
+                problems.append(f"{label} was not an active question in the baseline")
             continue
         old = [_mask_line(line) for line in before.body.splitlines()]
         new = [_mask_line(line) for line in block.body.splitlines()]

@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence
 
 from nvram_cli_prompts import confirm_write
-from nvram_crc import crc_header_mismatch
+from nvram_crc import crc_header_mismatch, extract_crc_header
 from nvram_editor import restore_point_path
 from nvram_parsing import find_blocks
 from nvram_safety import SettingChange, diff_texts, missing_questions, preflight_issues, structural_changes
@@ -247,12 +247,24 @@ class SCEWINRunner:
         candidate = Path(baseline) if baseline is not None else restore_point_path(script_path)
         return candidate if candidate.is_file() else None
 
-    def check_import(self, script_path: Path, baseline: Optional[Path] = None) -> List[str]:
+    def check_import(
+        self,
+        script_path: Path,
+        baseline: Optional[Path] = None,
+        *,
+        role: str = "import",
+        allow_unchecked: bool = False,
+    ) -> List[str]:
         """Return preflight problems for a script (empty list means it may be imported).
 
         ``baseline`` is the file to compare against (normally :meth:`snapshot`); it defaults
         to the restore point. Without any baseline the import is refused: nothing could say
-        what it would change.
+        what it would change. A file is never accepted as its own baseline either, unless
+        ``allow_unchecked`` says the caller knowingly skips the comparison.
+
+        ``role`` is ``"import"`` or ``"restore"``. A restore is checked the same way, with the
+        wording turned around (the script is the old export, the baseline is the BIOS now) and
+        one allowance: see :func:`nvram_safety.structural_changes`.
         """
 
         script_path = Path(script_path)
@@ -267,10 +279,23 @@ class SCEWINRunner:
                 "There is nothing to compare this file with (no restore point and no snapshot of the "
                 "current BIOS), so the changes cannot be checked. Run 'export' first."
             )
-        elif reference.resolve() != script_path.resolve():
+        elif reference.resolve() == script_path.resolve():
+            if not allow_unchecked:
+                issues.append(
+                    "This file would only be compared with itself, so nothing about it was checked. "
+                    "It needs a snapshot of the current BIOS to compare against."
+                )
+        else:
             original = _read_text(reference)
             mismatch = crc_header_mismatch(original, text)
-            if mismatch:
+            if mismatch and role == "restore":
+                issues.append(
+                    "The restore point comes from a different BIOS version than the one running now "
+                    f"(restore point: '{(extract_crc_header(text) or 'no HIICrc32 header').strip()}', "
+                    f"BIOS now: '{(extract_crc_header(original) or '').strip()}'), so it cannot put "
+                    f"the settings back. Delete '{script_path.name}' and export again to make a new one."
+                )
+            elif mismatch:
                 hint = (
                     f"If you updated the BIOS, delete '{restore_point_path(script_path).name}' and export again."
                     if reference == restore_point_path(script_path)
@@ -285,7 +310,7 @@ class SCEWINRunner:
                     f"{len(missing)} question(s) from your original export are gone from this file ({shown}{more}). "
                     "It may be truncated or damaged. (Commenting a question out with // is fine.)"
                 )
-            altered = structural_changes(original, text)
+            altered = structural_changes(original, text, allow_newly_active=role == "restore")
             if altered:
                 shown = "; ".join(altered[:3])
                 more = f" (and {len(altered) - 3} more)" if len(altered) > 3 else ""
@@ -306,20 +331,44 @@ class SCEWINRunner:
             return None
         return diff_texts(_read_text(reference), _read_text(script_path))
 
-    def import_script(self, script_path: Path, baseline: Optional[Path] = None) -> SCEWINResult:
+    def import_script(
+        self,
+        script_path: Path,
+        baseline: Optional[Path] = None,
+        *,
+        role: str = "import",
+        allow_unchecked: bool = False,
+    ) -> SCEWINResult:
         script_path = Path(script_path).resolve()
-        issues = self.check_import(script_path, baseline)
+        issues = self.check_import(script_path, baseline, role=role, allow_unchecked=allow_unchecked)
         if issues:
-            raise SCEWINError("Import blocked by preflight checks:\n- " + "\n- ".join(issues))
-        return self._execute("import", ["/i", "/s", str(script_path)], script_path)
+            what = "Restore" if role == "restore" else "Import"
+            raise SCEWINError(f"{what} blocked by preflight checks:\n- " + "\n- ".join(issues))
+        return replace(self._execute("import", ["/i", "/s", str(script_path)], script_path), action=role)
 
-    def restore(self, script_path: Path) -> SCEWINResult:
+    def existing_restore_point(self, script_path: Path) -> Path:
+        """The restore point that belongs to ``script_path``, or an error saying there is none."""
+
         restore_point = restore_point_path(Path(script_path).resolve())
         if not restore_point.is_file():
             raise SCEWINError(
                 f"No restore point found at '{restore_point}'. It is created by the first export."
             )
-        return replace(self.import_script(restore_point, baseline=restore_point), action="restore")
+        return restore_point
+
+    def restore(
+        self, script_path: Path, baseline: Optional[Path] = None, *, allow_unchecked: bool = False
+    ) -> SCEWINResult:
+        """Import the restore point, checked against ``baseline`` (a snapshot of the BIOS now).
+
+        A restore writes to the BIOS like any import, so it goes through the same checks.
+        Without a baseline it is refused unless ``allow_unchecked`` is set: the emergency path
+        for a BIOS that can no longer be read.
+        """
+
+        restore_point = self.existing_restore_point(script_path)
+        reference = Path(baseline) if baseline is not None else restore_point
+        return self.import_script(restore_point, reference, role="restore", allow_unchecked=allow_unchecked)
 
     def _execute(self, action: str, args: Sequence[str], script_path: Path) -> SCEWINResult:
         if not self._admin_check():
@@ -406,16 +455,16 @@ def _read_text(path: Path) -> str:
     return text.replace("\r\n", "\n")
 
 
-def _print_changes(changes: Optional[List[SettingChange]]) -> List[str]:
-    """Print the diff against the restore point; return the confirm-level changes."""
+def _print_changes(changes: Optional[List[SettingChange]], against: str = "the restore point") -> List[str]:
+    """Print the diff against a baseline; return the confirm-level changes."""
 
     if changes is None:
         print("No restore point found, so the changes cannot be listed. Export first to create one.")
         return []
     if not changes:
-        print("No settings differ from the restore point.")
+        print(f"No settings differ from {against}.")
         return []
-    print(f"{len(changes)} setting(s) differ from the restore point:")
+    print(f"{len(changes)} setting(s) differ from {against}:")
     for change in changes:
         print(f"  - {change.format()}")
     return [change.format() for change in changes if change.risk_keywords]
@@ -443,6 +492,14 @@ def add_subcommands(sub: "argparse._SubParsersAction") -> None:
     restore_parser = sub.add_parser("restore", help="Re-import the untouched copy saved by the first export")
     add_common(restore_parser)
     restore_parser.add_argument("--yes", action="store_true", help="Skip the Y/N question (scripts)")
+    restore_parser.add_argument(
+        "--allow-risky", action="store_true", help="Confirm putting risky settings back without asking (scripts)"
+    )
+    restore_parser.add_argument(
+        "--no-snapshot",
+        action="store_true",
+        help="Emergency only: write the restore point without reading the BIOS first (nothing is compared)",
+    )
     diagnose_parser = sub.add_parser("diagnose", help="Explain an existing SCEWIN log file")
     diagnose_parser.add_argument("log", type=Path, help="Path to log-file.txt")
 
@@ -497,14 +554,35 @@ def run(
                 return 1
             result = runner.import_script(args.file, baseline=baseline)
         else:
+            restore_point = runner.existing_restore_point(args.file)
+            baseline = None
+            risky_lines: List[str] = []
+            if args.no_snapshot:
+                print(
+                    f"WARNING: --no-snapshot: {restore_point.name} will be written without being compared "
+                    "with the BIOS. Nothing checks that it belongs to this BIOS version, the changes "
+                    "are not listed, and there will be no snapshot to undo it.",
+                    file=sys.stderr,
+                )
+            else:
+                baseline = runner.snapshot(args.file)
+                print(f"Read the current BIOS settings into {baseline.name} (compared against, and your undo).")
+                issues = runner.check_import(restore_point, baseline, role="restore")
+                if issues:
+                    raise SCEWINError("Restore blocked by preflight checks:\n- " + "\n- ".join(issues))
+                risky_lines = _print_changes(
+                    runner.changes_since_export(restore_point, baseline), against="what the BIOS holds now"
+                )
             if not confirm_write(
                 "Re-import the original export and undo all changes?",
+                risky_lines=risky_lines,
                 yes=args.yes,
+                allow_risky=args.allow_risky,
                 interactive=interactive,
                 ask=ask,
             ):
                 return 1
-            result = runner.restore(args.file)
+            result = runner.restore(args.file, baseline, allow_unchecked=args.no_snapshot)
     except SCEWINError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
