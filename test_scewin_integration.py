@@ -479,6 +479,26 @@ def test_structural_changes_catch_other_edits(old: str, new: str) -> None:
     assert nvram_safety.structural_changes(SAMPLE_EXPORT, SAMPLE_EXPORT.replace(old, new, 1))
 
 
+@pytest.mark.parametrize("marker", ["#", ";", "/", "# ", "; "])
+def test_a_question_hidden_behind_another_comment_marker_blocks_the_import(
+    tmp_path: Path, scewin_dir: Path, marker: str
+) -> None:
+    """Only ``//`` is a comment to SCEWIN: a changed question behind ``#`` or ``;`` must not slip through."""
+
+    run = FakeRun()
+    runner = make_runner(scewin_dir, run)
+    script = tmp_path / "nvram.txt"
+    runner.export(script)
+    hidden = _xhci_disabled(SAMPLE_EXPORT).replace("Setup Question\t= XHCI Hand-off", f"{marker}Setup Question\t= XHCI Hand-off")
+    script.write_text(hidden, encoding="utf-8")
+
+    issues = runner.check_import(script)
+    assert any("Only '//' comments a question out" in issue for issue in issues)
+    with pytest.raises(scewin_runner.SCEWINError, match="preflight"):
+        runner.import_script(script)
+    assert all("/i" not in call for call in run.calls)
+
+
 def test_structural_changes_flag_an_uncommented_question() -> None:
     commented = SAMPLE_EXPORT.replace("Setup Question\t= XHCI Hand-off", "//Setup Question\t= XHCI Hand-off")
     problems = nvram_safety.structural_changes(commented, SAMPLE_EXPORT)

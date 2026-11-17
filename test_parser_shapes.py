@@ -67,8 +67,6 @@ def test_names_are_not_cut_at_slashes_hashes_or_semicolons(name: str) -> None:
     "header, name, comment",
     [
         ("Setup Question\t= Fan Speed\t// SCEWIN note", "Fan Speed", "\t// SCEWIN note"),
-        ("Setup Question = Second    ; spaced inline", "Second", "    ; spaced inline"),
-        ("Setup Question = Third\t# hash inline", "Third", "\t# hash inline"),
         ("Setup Question = PCIe/GFX Lanes // note", "PCIe/GFX Lanes", " // note"),
     ],
 )
@@ -79,7 +77,38 @@ def test_real_trailing_comments_are_still_split_off(header: str, name: str, comm
     assert rebuild_text(blocks, trailing) == text
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["Second    ; spaced inline", "Third\t# hash inline"],
+)
+def test_hash_and_semicolon_never_start_a_comment(name: str) -> None:
+    """SCEWIN only knows ``//``; anything else stays part of the name, where the checks see it."""
+
+    text = f"Setup Question = {name}\nValue =<1>\n"
+    blocks, trailing = nvram_parsing.find_blocks(text)
+    assert blocks[0].name == name and blocks[0].inline_comment == ""
+    assert rebuild_text(blocks, trailing) == text
+
+
 # --- commented-out questions ------------------------------------------------
+@pytest.mark.parametrize("marker", ["#", ";", "/", "# ", "; ", "/ "])
+def test_only_double_slash_comments_a_question_out(marker: str) -> None:
+    text = (
+        "Setup Question = First\nOptions =*[00]A\n         [01]B\n\n"
+        f"{marker}Setup Question = Second\nOptions =[00]A\n         *[01]B\n"
+    )
+    blocks, trailing = nvram_parsing.find_blocks(text)
+    # Not a header: the line stays in the body of the question before it, so nothing is hidden.
+    assert [(b.name, b.is_commented) for b in blocks] == [("First", False)]
+    assert f"{marker}Setup Question = Second" in blocks[0].body
+    assert rebuild_text(blocks, trailing) == text
+
+
+def test_double_slash_question_is_inactive() -> None:
+    blocks, _ = nvram_parsing.find_blocks("//Setup Question = A\n// Value =<1>\n\n// Setup Question = B\n")
+    assert [(b.name, b.is_commented) for b in blocks] == [("A", True), ("B", True)]
+
+
 
 
 def test_commented_twin_is_flagged_and_has_no_fields(manager) -> None:

@@ -16,26 +16,26 @@ LOGGER = logging.getLogger(__name__)
 
 BLOCK_PATTERN = re.compile(
     r"""
-    (?P<header_line>^\s*(?:[#;/]{0,2}\s*)?Setup\s+Question\s*=\s*(?P<name>[^\r\n]*?))
+    (?P<header_line>^\s*(?://[ \t]*)?Setup\s+Question\s*=\s*(?P<name>[^\r\n]*?))
     (?P<header_ending>\r?\n|\r|\n)
     (?P<body>
         (?:
             (?!
-                ^\s*(?:[#;/]{0,2}\s*)?Setup\s+Question\b
+                ^\s*(?://[ \t]*)?Setup\s+Question\b
             )
             [\s\S]
         )*?
     )
-    (?=^\s*(?:[#;/]{0,2}\s*)?Setup\s+Question\b|\Z)
+    (?=^\s*(?://[ \t]*)?Setup\s+Question\b|\Z)
     """,
     re.IGNORECASE | re.MULTILINE | re.VERBOSE,
 )
 HELP_PATTERN = re.compile(
-    r"^\s*(?:[#;/]{0,2}\s*)?Help\s+String\s*=\s*(?P<help>[^\r\n]*)",
+    r"^\s*(?://[ \t]*)?Help\s+String\s*=\s*(?P<help>[^\r\n]*)",
     re.MULTILINE,
 )
 TOKEN_PATTERN = re.compile(
-    r"^\s*(?:[#;/]{0,2}\s*)?Token\s*=\s*(?P<token>.+)",
+    r"^\s*(?://[ \t]*)?Token\s*=\s*(?P<token>.+)",
     re.MULTILINE,
 )
 _NUMBER = r"[+-]?(?:0x[0-9A-Fa-f]+|\d+)"
@@ -112,7 +112,7 @@ def find_blocks(text: str) -> tuple[List[QuestionBlock], str]:
         header_without_leading = header_line[len(leading_whitespace) :]
         header_core, inline_comment = _split_inline_comment(header_without_leading)
         setup_match = re.match(
-            r"(?P<prefix>(?:[#;/]{0,2}\s*)?Setup\s+Question\s*=\s*)(?P<name>.*)",
+            r"(?P<prefix>(?://[ \t]*)?Setup\s+Question\s*=\s*)(?P<name>.*)",
             header_core,
             re.IGNORECASE,
         )
@@ -129,7 +129,7 @@ def find_blocks(text: str) -> tuple[List[QuestionBlock], str]:
         min_value = _parse_range_value(min_match, "min")
         max_value = _parse_range_value(max_match, "max")
         width = _parse_width(WIDTH_PATTERN.search(body))
-        is_commented = header_without_leading[:1] in ("#", ";", "/")
+        is_commented = header_without_leading.startswith("//")
         cursor = match.end()
         cleaned_token: Optional[str] = None
         if token_match:
@@ -171,15 +171,15 @@ def _extract_leading_whitespace(line: str) -> str:
 
 
 def _split_inline_comment(line: str) -> tuple[str, str]:
-    """Split a trailing ``// ...``, ``; ...`` or ``# ...`` comment off a header line.
+    """Split a trailing ``// ...`` comment off a header line.
 
-    SCEWIN itself only writes ``//`` comments. A marker only starts a comment when
-    whitespace comes before it, and ``#`` / ``;`` also need whitespace after them.
-    Question names contain these characters ("PCIe/GFX Lanes",
-    "Clock Power Management(CLKREQ#)", "Boot Option #1") and must not be cut short.
+    ``//`` is the only comment marker SCEWIN knows, so it is the only one honoured here:
+    treating ``#`` or ``;`` as comments would hide text from the import checks that
+    SCEWIN may still read. The marker only starts a comment when whitespace comes
+    before it; question names contain slashes ("PCIe/GFX Lanes") and must not be cut short.
     """
 
-    comment_match = re.search(r"(\s+(?://.*|[#;](?:\s.*)?))$", line)
+    comment_match = re.search(r"(\s+//.*)$", line)
     if not comment_match:
         return line, ""
     start_index = comment_match.start(1)

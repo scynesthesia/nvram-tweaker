@@ -65,6 +65,11 @@ NOTE_KEYWORDS: Tuple[str, ...] = (
 
 # SCEWIN appends a '// Move "*" to the desired Option' hint to option lines.
 _INLINE_COMMENT = re.compile(r"\s//")
+# A question header as the parser accepts it (live, or commented out with ``//``), and anything
+# else that looks like one. ``//`` is the only comment marker SCEWIN knows; a header behind
+# ``#``, ``;`` or a single ``/`` is not a comment to it, so such a line must not pass unnoticed.
+_ACCEPTED_HEADER = re.compile(r"^[ \t]*(?://[ \t]*)?Setup\s+Question\s*=", re.IGNORECASE)
+_HEADER_LIKE = re.compile(r"^[^A-Za-z0-9]*Setup\s+Question\s*=", re.IGNORECASE)
 
 
 def _compile(keywords: Iterable[str]) -> Tuple[Tuple[str, "re.Pattern[str]"], ...]:
@@ -283,6 +288,13 @@ def preflight_issues(text: str) -> List[str]:
 
     if rebuild_text(blocks, trailing_text=trailing) != text:
         issues.append("The file does not round-trip through the parser; refusing to import it.")
+
+    for number, line in enumerate(text.split("\n"), start=1):
+        if _HEADER_LIKE.match(line) and not _ACCEPTED_HEADER.match(line):
+            issues.append(
+                f"Line {number} looks like a 'Setup Question' behind something other than '//' "
+                f"({line.strip()[:60]!r}). Only '//' comments a question out."
+            )
 
     for block in blocks:
         if block.is_commented:
