@@ -140,6 +140,19 @@ _KNOWN_MESSAGES: Tuple[Tuple[Pattern[str], Diagnosis], ...] = (
 )
 
 
+def no_usable_export(reason: str) -> Diagnosis:
+    """SCEWIN looked successful but the file it should have written is missing or not an export."""
+
+    return Diagnosis(
+        key="no_output",
+        severity="error",
+        title="SCEWIN did not produce a usable export",
+        cause=f"{reason} SCEWIN reported no error this tool recognises.",
+        fix="Read SCEWIN's output in the log file. Nothing was read from the BIOS, so nothing was "
+        "compared or written.",
+    )
+
+
 def diagnose(output: str) -> List[Diagnosis]:
     """Return the known problems found in SCEWIN output, in order of first appearance."""
 
@@ -156,4 +169,4 @@ def has_errors(diagnoses: List[Diagnosis]) -> bool:
     return any(diagnosis.severity == "error" for diagnosis in diagnoses)
 
 
-__all__ = ["Diagnosis", "REFERENCE_URL", "diagnose", "has_errors"]
+__all__ = ["Diagnosis", "REFERENCE_URL", "diagnose", "has_errors", "no_usable_export"]

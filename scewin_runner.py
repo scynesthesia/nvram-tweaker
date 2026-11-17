@@ -35,8 +35,9 @@ from typing import Callable, Iterable, List, Optional, Sequence
 from nvram_cli_prompts import confirm_write
 from nvram_crc import crc_header_mismatch
 from nvram_editor import restore_point_path
+from nvram_parsing import find_blocks
 from nvram_safety import SettingChange, diff_texts, missing_questions, preflight_issues, structural_changes
-from scewin_diagnostics import REFERENCE_URL, Diagnosis, diagnose, has_errors
+from scewin_diagnostics import REFERENCE_URL, Diagnosis, diagnose, has_errors, no_usable_export
 
 SCEWIN_EXE = "SCEWIN_64.exe"
 REQUIRED_FILES = (SCEWIN_EXE, "amifldrv64.sys", "amigendrv64.sys")
@@ -69,6 +70,8 @@ class SCEWINResult:
     log_path: Path
     diagnoses: List[Diagnosis] = field(default_factory=list)
     restore_point_created: bool = False
+    # Set when SCEWIN ran but its output could not be saved to ``log_path``.
+    log_error: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -90,7 +93,8 @@ class SCEWINResult:
 
     def summary_lines(self) -> List[str]:
         status = "succeeded" if self.ok else f"failed (exit code {self.returncode})"
-        lines = [f"SCEWIN {self.action} {status}. Output saved to {self.log_path}."]
+        saved = f"Output saved to {self.log_path}." if not self.log_error else self.log_error
+        lines = [f"SCEWIN {self.action} {status}. {saved}"]
         if self.restore_point_created:
             lines.append("Saved an untouched restore point of this export.")
         if self.may_be_partial:
@@ -179,11 +183,11 @@ class SCEWINRunner:
         if script_path.is_file():
             # SCEWIN overwrites the file; keep what was there (hand edits) as <name>.bak.
             shutil.copy2(script_path, script_path.with_name(script_path.name + ".bak"))
-        result = self._execute("export", ["/o", "/s", str(script_path)], script_path)
+        result = self._read_bios("export", script_path, script_path)
 
         created = False
         restore_point = restore_point_path(script_path)
-        if result.ok and script_path.is_file() and not restore_point.exists():
+        if result.ok and not restore_point.exists():
             shutil.copy2(script_path, restore_point)
             created = True
         if created:
@@ -201,14 +205,43 @@ class SCEWINRunner:
 
         script_path = Path(script_path).resolve()
         target = script_path.with_name(f"{script_path.stem}.preimport{script_path.suffix}")
-        result = self._execute("snapshot", ["/o", "/s", str(target)], script_path)
-        if not result.ok or not target.is_file():
+        result = self._read_bios("snapshot", target, script_path)
+        if not result.ok:
             lines = "\n".join(result.summary_lines())
             raise SCEWINError(f"Could not read the current BIOS settings, so nothing was imported.\n{lines}")
         restore_point = restore_point_path(script_path)
         if not restore_point.exists():
             shutil.copy2(target, restore_point)
         return target
+
+    def _read_bios(self, action: str, target: Path, log_anchor: Path) -> SCEWINResult:
+        """Have SCEWIN write the live settings to ``target``, and prove the file is new.
+
+        A file already at ``target`` is moved aside first, so whatever is there afterwards was
+        written by this run: an old export can never pass for a fresh read of the BIOS when
+        SCEWIN fails without a message this tool knows. The new file must also look like an
+        export. If the run fails either way, the previous file is put back untouched.
+        """
+
+        hold = target.with_name(f".{target.name}.prev")
+        had_previous = target.is_file()
+        if had_previous:
+            os.replace(target, hold)
+        fresh = False
+        try:
+            result = self._execute(action, ["/o", "/s", str(target)], log_anchor)
+            if result.ok:
+                problem = _export_problem(target)
+                if problem:
+                    result = replace(result, diagnoses=[*result.diagnoses, no_usable_export(problem)])
+            fresh = result.ok
+            return result
+        finally:
+            if not fresh:
+                target.unlink(missing_ok=True)
+                if had_previous:
+                    os.replace(hold, target)
+            hold.unlink(missing_ok=True)
 
     def _resolve_baseline(self, script_path: Path, baseline: Optional[Path]) -> Optional[Path]:
         candidate = Path(baseline) if baseline is not None else restore_point_path(script_path)
@@ -321,7 +354,13 @@ class SCEWINRunner:
 
         output = (completed.stdout or "") + (completed.stderr or "")
         log_path = script_path.with_name(LOG_FILE_NAME)
-        log_path.write_text(output, encoding="utf-8")
+        log_error: Optional[str] = None
+        try:
+            log_path.write_text(output, encoding="utf-8")
+        except OSError as exc:
+            # SCEWIN has already run (and may have written to the BIOS): report the result
+            # rather than let a log that cannot be saved hide it.
+            log_error = f"Its output could not be saved to {log_path} ({exc})."
         return SCEWINResult(
             action=action,
             command=command,
@@ -329,6 +368,7 @@ class SCEWINRunner:
             output=output,
             log_path=log_path,
             diagnoses=diagnose(output),
+            log_error=log_error,
         )
 
 
@@ -340,6 +380,22 @@ def _window_options(is_windows: bool) -> dict:
     Windows flashes a console window for every SCEWIN call. (Not valid on other systems.)"""
 
     return {"creationflags": CREATE_NO_WINDOW} if is_windows else {}
+
+
+def _export_problem(path: Path) -> Optional[str]:
+    """Why ``path`` is not a usable export SCEWIN just wrote, or None when it is one."""
+
+    if not path.is_file():
+        return f"No file was written to '{path}'."
+    try:
+        if path.stat().st_size == 0:
+            return f"'{path.name}' was written empty."
+        blocks, _ = find_blocks(_read_text(path))
+    except OSError as exc:
+        return f"'{path.name}' could not be read back ({exc})."
+    if not any(not block.is_commented for block in blocks):
+        return f"'{path.name}' contains no active 'Setup Question', so it is not an export."
+    return None
 
 
 def _read_text(path: Path) -> str:
