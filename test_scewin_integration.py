@@ -108,11 +108,44 @@ def test_warnings_do_not_count_as_errors() -> None:
         ("CPU Core Voltage", ["Voltage"]),
         ("Primary Video Adaptor", ["Primary Video"]),
         ("BIOS CSM/UEFI Mode", ["CSM"]),
+        # plurals and spellings without a word boundary
+        ("DRAM Voltages", ["Voltage"]),
+        ("Package Power Limits", ["Power Limit"]),
+        ("dTPM", ["dTPM"]),
+        ("SecureBoot", ["SecureBoot"]),
+        ("Security Device Support", ["Security Device"]),
+        # storage mode: the wrong one leaves an installed system unbootable
+        ("SATA Mode Selection", ["SATA Mode"]),
+        ("OnChip SATA Type", ["SATA Type"]),
+        ("NVMe RAID mode", ["RAID"]),
+        ("Enable VMD controller", ["VMD"]),
+        # clocks, multipliers, overclocking, voltages by another name
+        ("Above 4G Decoding", ["Above 4G"]),
+        ("CPU Core Ratio", ["Ratio"]),
+        ("BCLK Frequency", ["BCLK"]),
+        ("Custom Pstate0", ["Pstate"]),
+        ("Pstate0 VID", ["Pstate", "VID"]),
+        ("Adjust VID Value", ["VID"]),
+        ("Load Line Calibration", ["Load Line"]),
+        ("Adjust VRM SVI2 - VDDCR_CPU", ["VDDCR"]),
+        ("Adjust MEM VDDIO Value", ["VDDIO"]),
+        ("SOC OVERCLOCK VID", ["Overclock", "VID"]),
+        ("OC Mode", ["OC Mode"]),
+        ("PBO Limits", ["PBO"]),
+        ("Boot Guard", ["Boot Guard"]),
+        ("Administrator Password", ["Password"]),
+        # a keyword inside a longer word is not a match
+        ("Primary Video Adaptor Videos", ["Primary Video"]),
+        ("Video Memory", []),
+        ("Erased Blocks", []),
+        ("Operation Mode", []),
         # note-level words never ask for confirmation
         ("Legacy USB Support", []),
         ("Native ASPM", []),
-        ("OnChip SATA Type", []),
+        ("SATA Port 0 Hot Plug", []),
         ("Fan Start Temperature", []),
+        ("Precision Boost Overdrive Scalar", []),
+        ("Core 0 Curve Optimizer Sign", []),
         ("Busy Wait", []),
     ],
 )
@@ -128,7 +161,12 @@ def test_risky_keywords(name: str, expected: List[str]) -> None:
         ("OnChip SATA Type", ["SATA"]),
         ("PCIE PORT 0", ["PCIe"]),
         ("XHCI Hand-off", []),
-        ("Fan Start Temperature", []),
+        ("Fan Start Temperature", ["Fan"]),
+        ("CPU Fan1 Smart Fan Control", ["Fan"]),
+        ("Platform Thermal Throttle Limit", ["Thermal"]),
+        ("Precision Boost Overdrive", ["Precision Boost"]),
+        ("All Core Curve Optimizer Magnitude", ["Curve Optimizer"]),
+        ("Busy Wait", []),
     ],
 )
 def test_noted_keywords(name: str, expected: List[str]) -> None:
@@ -136,8 +174,8 @@ def test_noted_keywords(name: str, expected: List[str]) -> None:
 
 
 def test_diff_marks_note_level_changes_without_flagging_risk() -> None:
-    before = "Setup Question = OnChip SATA Type\nOptions =*[00]AHCI\n         [01]RAID\n"
-    after = "Setup Question = OnChip SATA Type\nOptions =[00]AHCI\n         *[01]RAID\n"
+    before = "Setup Question = OnChip SATA Channel\nOptions =*[00]AHCI\n         [01]RAID\n"
+    after = "Setup Question = OnChip SATA Channel\nOptions =[00]AHCI\n         *[01]RAID\n"
     (change,) = nvram_safety.diff_texts(before, after)
     assert change.risk_keywords == () and change.note_keywords == ("SATA",)
     assert "[note: SATA]" in change.format() and "RISK" not in change.format()
@@ -277,9 +315,49 @@ def test_restore_imports_the_restore_point(tmp_path: Path, scewin_dir: Path) -> 
         ("Fan Start Temperature", "Value <30>", "Value <45>")
     ]
 
-    result = runner.restore(script)
+    baseline = runner.snapshot(script)
+    result = runner.restore(script, baseline)
     assert result.action == "restore"
     assert run.calls[-1][1:] == ["/i", "/s", str((tmp_path / "nvram.original.txt").resolve())]
+
+
+def test_restore_is_refused_without_a_snapshot_to_compare_against(tmp_path: Path, scewin_dir: Path) -> None:
+    run = FakeRun()
+    runner = make_runner(scewin_dir, run)
+    script = tmp_path / "nvram.txt"
+    runner.export(script)
+
+    with pytest.raises(scewin_runner.SCEWINError, match="only be compared with itself"):
+        runner.restore(script)
+    assert all("/i" not in call for call in run.calls)
+
+    assert runner.restore(script, allow_unchecked=True).ok  # the explicit emergency path
+    assert run.calls[-1][1] == "/i"
+
+
+def test_a_file_is_never_its_own_baseline(tmp_path: Path, scewin_dir: Path) -> None:
+    runner = make_runner(scewin_dir, FakeRun())
+    script = tmp_path / "nvram.txt"
+    runner.export(script)
+    assert any("compared with itself" in issue for issue in runner.check_import(script, script))
+
+
+def test_restore_allows_questions_the_bios_hides_right_now(tmp_path: Path, scewin_dir: Path) -> None:
+    """Which questions are active can depend on other settings; an untouched restore point is still valid."""
+
+    script = tmp_path / "nvram.txt"
+    make_runner(scewin_dir, FakeRun()).export(script)
+    hidden_now = SAMPLE_EXPORT.replace(
+        "Setup Question\t= Fan Start Temperature", "// Setup Question\t= Fan Start Temperature"
+    ).replace("BIOS Default =<30>\nValue\t=<30>", "// BIOS Default =<30>\n// Value\t=<30>")
+    runner = make_runner(scewin_dir, LiveBiosRun(hidden_now))
+    baseline = runner.snapshot(script)
+    restore_point = tmp_path / "nvram.original.txt"
+
+    assert runner.check_import(restore_point, baseline, role="restore") == []
+    assert any("was not an active question" in issue for issue in runner.check_import(restore_point, baseline))
+    changes = runner.changes_since_export(restore_point, baseline)
+    assert [(c.name, c.before, c.after) for c in changes] == [("Fan Start Temperature", None, "Value <30>")]
 
 
 def test_restore_without_restore_point_fails(tmp_path: Path, scewin_dir: Path) -> None:
@@ -477,6 +555,26 @@ def test_structural_changes_ignore_the_star_and_the_number() -> None:
 def test_structural_changes_catch_other_edits(old: str, new: str) -> None:
     assert old in SAMPLE_EXPORT
     assert nvram_safety.structural_changes(SAMPLE_EXPORT, SAMPLE_EXPORT.replace(old, new, 1))
+
+
+@pytest.mark.parametrize("marker", ["#", ";", "/", "# ", "; "])
+def test_a_question_hidden_behind_another_comment_marker_blocks_the_import(
+    tmp_path: Path, scewin_dir: Path, marker: str
+) -> None:
+    """Only ``//`` is a comment to SCEWIN: a changed question behind ``#`` or ``;`` must not slip through."""
+
+    run = FakeRun()
+    runner = make_runner(scewin_dir, run)
+    script = tmp_path / "nvram.txt"
+    runner.export(script)
+    hidden = _xhci_disabled(SAMPLE_EXPORT).replace("Setup Question\t= XHCI Hand-off", f"{marker}Setup Question\t= XHCI Hand-off")
+    script.write_text(hidden, encoding="utf-8")
+
+    issues = runner.check_import(script)
+    assert any("Only '//' comments a question out" in issue for issue in issues)
+    with pytest.raises(scewin_runner.SCEWINError, match="preflight"):
+        runner.import_script(script)
+    assert all("/i" not in call for call in run.calls)
 
 
 def test_structural_changes_flag_an_uncommented_question() -> None:

@@ -21,8 +21,8 @@ from typing import Callable, List, Optional, Sequence
 import nvram_settings
 import scewin_runner
 from nvram_cli_prompts import confirm_write, is_interactive
-from nvram_editor import NVRAMManager, apply_changes, restore_point_path
-from nvram_parsing import validate_numeric_input
+from nvram_editor import NVRAMManager, apply_changes
+from nvram_parsing import has_unreadable_value, validate_numeric_input
 from nvram_safety import current_setting, diff_blocks, noted_keywords, option_text, risky_keywords
 from nvram_structures import OptionField, QuestionBlock, ValueField
 from nvram_version import __version__
@@ -45,12 +45,26 @@ Tokens are hexadecimal as printed in the export (7D1 and 0x7d1 are the same).
 """
 
 
+UNREADABLE_VALUE = "(Value line not readable as a number; read-only)"
+
+
 def _kind(block: QuestionBlock) -> str:
+    if has_unreadable_value(block.body):
+        return "unreadable"
     if any(isinstance(f, ValueField) for f in block.fields):
         return "value"
     if any(isinstance(f, OptionField) for f in block.fields):
         return "option"
     return "none"
+
+
+def _stored_as(block: QuestionBlock) -> Optional[str]:
+    """How the file writes a numeric setting: ``decimal`` (``<30>``) or ``hexadecimal`` (bare ``1E``)."""
+
+    for field in block.fields:
+        if isinstance(field, ValueField):
+            return "hexadecimal" if field.base == 16 else "decimal"
+    return None
 
 
 def _flags(block: QuestionBlock) -> str:
@@ -84,7 +98,7 @@ def cmd_list(args: argparse.Namespace) -> int:
                 "token": block.token,
                 "name": block.name,
                 "kind": _kind(block),
-                "setting": current_setting(block),
+                "setting": UNREADABLE_VALUE if _kind(block) == "unreadable" else current_setting(block),
                 "width": block.width,
                 "risk": risky_keywords(block.name),
                 "note": noted_keywords(block.name),
@@ -121,7 +135,8 @@ def cmd_show(args: argparse.Namespace) -> int:
                 "name": block.name,
                 "token": block.token,
                 "kind": _kind(block),
-                "setting": current_setting(block),
+                "setting": UNREADABLE_VALUE if _kind(block) == "unreadable" else current_setting(block),
+                "stored_as": _stored_as(block),
                 "width_bytes": block.width,
                 "range": [low, high] if _kind(block) == "value" else None,
                 "options": [option_text(f) for f in block.fields if isinstance(f, OptionField)],
@@ -146,6 +161,8 @@ def cmd_show(args: argparse.Namespace) -> int:
             low, high = item["range"]
             size = f", {item['width_bytes']}-byte setting" if item["width_bytes"] else ""
             print(f"Range:    {low} to {high}{size}")
+            if item["stored_as"] == "hexadecimal":
+                print("Stored:   in hexadecimal in the file; enter decimal, or hexadecimal with 0x")
         for text in item["options"]:
             print(f"  {'*' if text in item['selected'] else ' '} {text}")
         if item["help"]:
@@ -234,6 +251,11 @@ def cmd_set(
                 notes.append(note)
         elif mode == "option":
             updated = apply_changes(manager, updated, [index], args.value, None)
+        elif mode == "unreadable":
+            raise ValueError(
+                f"'{block.name}' (line {block.line_number}) has a Value line this tool cannot read as a number, "
+                "so it is read-only."
+            )
         else:
             raise ValueError(f"'{block.name}' (line {block.line_number}) has no options or number to set.")
 
@@ -263,7 +285,7 @@ def cmd_set(
         return EXIT_ERROR
 
     manager.save(args.file, manager.rebuild_text(updated))
-    print(f"Saved {args.file}. Previous version: {args.file.name}.bak. Untouched original: {restore_point_path(args.file).name}.")
+    print(f"Saved {args.file}. Previous version: {args.file.name}.bak.")
     return EXIT_OK
 
 

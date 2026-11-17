@@ -71,7 +71,7 @@ def test_list_json_is_machine_readable(export, capsys) -> None:
         "kind": "value",
         "setting": "Value <0>",
         "width": 2,
-        "risk": [],
+        "risk": ["VID"],
         "note": [],
     }
 
@@ -129,26 +129,26 @@ def test_dry_run_prints_the_change_and_touches_nothing(export, capsys) -> None:
 
 def test_set_without_yes_refuses_when_not_interactive(export, capsys) -> None:
     before = export.read_bytes()
-    code, _, err = run_cli(capsys, "set", export, "Adjust VID", "300")
+    code, _, err = run_cli(capsys, "set", export, "Adjust VID", "300", "--allow-risky")
     assert code == 1 and "pass --yes" in err
     assert export.read_bytes() == before
 
 
-def test_set_with_yes_changes_exactly_one_line_and_keeps_the_original(export, capsys) -> None:
+def test_set_with_yes_changes_exactly_one_line_and_keeps_a_bak(export, capsys) -> None:
     before = export.read_bytes()
-    code, out, _ = run_cli(capsys, "set", export, "Adjust VID", "300", "--yes")
+    code, out, _ = run_cli(capsys, "set", export, "Adjust VID", "300", "--yes", "--allow-risky")
     assert code == 0 and "Saved" in out
     assert changed_lines(before, export.read_bytes()) == [(b"Value\t=<0>\r", b"Value\t=<300>\r")]
     assert (export.parent / "nvram.txt.bak").read_bytes() == before
-    assert (export.parent / "nvram.original.txt").read_bytes() == before
 
 
-def test_the_original_survives_later_saves(export, capsys) -> None:
-    before = export.read_bytes()
-    run_cli(capsys, "set", export, "Adjust VID", "300", "--yes")
-    run_cli(capsys, "set", export, "Adjust VID", "400", "--yes")
-    assert (export.parent / "nvram.original.txt").read_bytes() == before  # not the 300 version
-    assert b"<300>" in (export.parent / "nvram.txt.bak").read_bytes()  # .bak is only the previous save
+def test_saving_a_file_never_creates_the_restore_point(export, capsys) -> None:
+    """The restore point is what 'restore' writes to the BIOS, so only the BIOS may supply it."""
+
+    run_cli(capsys, "set", export, "Adjust VID", "300", "--yes", "--allow-risky")
+    run_cli(capsys, "set", export, "Adjust VID", "400", "--yes", "--allow-risky")
+    assert not (export.parent / "nvram.original.txt").exists()
+    assert b"<300>" in (export.parent / "nvram.txt.bak").read_bytes()  # .bak is the previous save
 
 
 def test_setting_the_current_value_is_a_no_op(export, capsys) -> None:
@@ -162,6 +162,37 @@ def test_a_bare_value_keeps_its_form(export, capsys) -> None:
     code, _, _ = run_cli(capsys, "set", export, "SataRedrv Com", "7", "--yes")
     assert code == 0
     assert changed_lines(before, export.read_bytes()) == [(b"Value\t=0\r", b"Value\t=7\r")]
+
+
+def test_a_bare_value_is_hexadecimal(export, capsys) -> None:
+    """``Value =64`` in a real export is 0x64: asking for 200 must write ``C8``, not ``200``."""
+
+    code, out, _ = run_cli(capsys, "show", export, "CAKE CRC perf bounds")
+    assert code == 0 and "Value 0x64 (100)" in out and "hexadecimal" in out
+
+    before = export.read_bytes()
+    code, out, _ = run_cli(capsys, "set", export, "CAKE CRC perf bounds", "200", "--yes")
+    assert code == 0 and "Value 0x64 (100) -> Value 0xC8 (200)" in out
+    assert changed_lines(before, export.read_bytes()) == [(b"Value\t=64\r", b"Value\t=C8\r")]
+
+
+def test_a_bare_value_with_hex_letters_is_read_whole_and_edited_whole(export, capsys) -> None:
+    export.write_bytes(export.read_bytes().replace(b"Width\t=02\r\nValue\t=0\r\n", b"Width\t=02\r\nValue\t=3FF\r\n"))
+    before = export.read_bytes()
+    code, out, _ = run_cli(capsys, "set", export, "Trcpage", "10", "--yes")
+    assert code == 0 and "Value 0x3FF (1023) -> Value 0xA (10)" in out
+    assert changed_lines(before, export.read_bytes()) == [(b"Value\t=3FF\r", b"Value\t=A\r")]
+
+
+def test_an_unreadable_value_is_listed_but_read_only(export, capsys) -> None:
+    export.write_bytes(export.read_bytes().replace(b"Width\t=02\r\nValue\t=0\r\n", b"Width\t=02\r\nValue\t=3 FF\r\n"))
+    before = export.read_bytes()
+    code, out, _ = run_cli(capsys, "show", export, "Trcpage")
+    assert code == 0 and "read-only" in out
+    for mode in ("auto", "value"):
+        code, _, err = run_cli(capsys, "set", export, "Trcpage", "10", "--yes", "--mode", mode)
+        assert code == 1 and ("read-only" in err or "left alone" in err)
+    assert export.read_bytes() == before
 
 
 # --- set: risky settings -----------------------------------------------------------
@@ -208,18 +239,18 @@ def test_ambiguous_match_is_refused_when_scripted(export, capsys) -> None:
 
 
 def test_token_narrows_an_ambiguous_match(export, capsys) -> None:
-    code, _, _ = run_cli(capsys, "set", export, "Value", "5", "--token", "0x18", "--yes")
+    code, _, _ = run_cli(capsys, "set", export, "Value", "5", "--token", "0x18", "--yes", "--allow-risky")
     assert code == 0
     assert b"Value\t=<5>" in export.read_bytes()
 
 
 def test_all_changes_every_match(export, capsys) -> None:
-    code, out, _ = run_cli(capsys, "set", export, "Value", "5", "--all", "--yes")
+    code, out, _ = run_cli(capsys, "set", export, "Value", "5", "--all", "--yes", "--allow-risky")
     assert code == 0 and "3 setting(s) will change" in out
 
 
 def test_interactive_choice_among_several_matches(export, capsys) -> None:
-    code, out, _ = run_cli(capsys, "set", export, "Value", "5", interactive=True, answers=["2", "y"])
+    code, out, _ = run_cli(capsys, "set", export, "Value", "5", interactive=True, answers=["2", "YES", "y"])
     assert code == 0 and "1 setting(s) will change" in out
     assert b"Value\t=<5>" in export.read_bytes()
 
@@ -334,9 +365,92 @@ def test_export_set_import_restore_through_the_cli(fake_scewin, tmp_path, capsys
     assert code == 0 and "XHCI Hand-off" in out
     assert fake.calls[-1][1:3] == ["/i", "/s"]
 
-    code, _, _ = run_cli(capsys, "restore", "--scewin", scewin_dir, "--file", script, "--yes")
-    assert code == 0
+    code, out, _ = run_cli(capsys, "restore", "--scewin", scewin_dir, "--file", script, "--yes")
+    assert code == 0 and "nvram.preimport.txt" in out
+    assert fake.calls[-2][1] == "/o"  # the BIOS is read first, as for an import
     assert fake.calls[-1][-1] == str((script.parent / "nvram.original.txt").resolve())
+
+
+class _ChangedBios(FakeRun):
+    """A BIOS whose settings differ from SAMPLE_EXPORT: what every read returns after the first export."""
+
+    def __init__(self, live_text: str) -> None:
+        super().__init__()
+        self.live_text = live_text
+        self.exports = 0
+
+    def __call__(self, command, **kwargs):
+        result = super().__call__(command, **kwargs)
+        if "/o" in command:
+            self.exports += 1
+            if self.exports > 1:
+                Path(command[-1]).write_text(self.live_text, encoding="utf-8")
+        return result
+
+
+def _restore_setup(monkeypatch, tmp_path, capsys, live_text: str):
+    scewin_dir = tmp_path / "SCEWIN"
+    scewin_dir.mkdir()
+    for name in scewin_runner.REQUIRED_FILES:
+        (scewin_dir / name).write_bytes(b"")
+    fake = _ChangedBios(live_text)
+    monkeypatch.setattr(
+        scewin_runner, "SCEWINRunner", functools.partial(scewin_runner.SCEWINRunner, run=fake, admin_check=lambda: True)
+    )
+    script = tmp_path / "nvram.txt"
+    assert run_cli(capsys, "export", "--scewin", scewin_dir, "--file", script)[0] == 0
+    return scewin_dir, fake, script
+
+
+XHCI_OFF = SAMPLE_EXPORT.replace(
+    '[00]Disabled\t// Move "*" to the desired Option\n         *[01]Enabled',
+    '*[00]Disabled\t// Move "*" to the desired Option\n         [01]Enabled',
+)
+
+
+def test_restore_lists_what_it_puts_back_and_asks_about_risky_settings(monkeypatch, tmp_path, capsys) -> None:
+    live = XHCI_OFF.replace("Value\t=<30>", "Value\t=<45>")
+    scewin_dir, fake, script = _restore_setup(monkeypatch, tmp_path, capsys, live)
+
+    code, out, err = run_cli(capsys, "restore", "--scewin", scewin_dir, "--file", script, "--yes")
+    assert code == 1 and "--allow-risky" in err  # XHCI is confirm-level, also on the way back
+    assert "Fan Start Temperature (Token: 2B): Value <45> -> Value <30>" in out
+    assert "XHCI Hand-off" in out and "[RISK: XHCI]" in out
+    assert all("/i" not in call for call in fake.calls)
+
+    code, _, _ = run_cli(capsys, "restore", "--scewin", scewin_dir, "--file", script, "--yes", "--allow-risky")
+    assert code == 0
+    assert fake.calls[-1][1:] == ["/i", "/s", str((tmp_path / "nvram.original.txt").resolve())]
+    assert (tmp_path / "nvram.preimport.txt").read_text(encoding="utf-8") == live  # the undo for the restore
+
+
+def test_restore_is_blocked_when_the_bios_version_changed(monkeypatch, tmp_path, capsys) -> None:
+    updated_bios = SAMPLE_EXPORT.replace("HIICrc32= 5B2C3F1A", "HIICrc32= 0BADF00D")
+    scewin_dir, fake, script = _restore_setup(monkeypatch, tmp_path, capsys, updated_bios)
+
+    code, _, err = run_cli(capsys, "restore", "--scewin", scewin_dir, "--file", script, "--yes", "--allow-risky")
+    assert code == 1 and "different BIOS version" in err and "0BADF00D" in err
+    assert all("/i" not in call for call in fake.calls)
+
+
+def test_restore_is_blocked_when_the_restore_point_was_edited_by_hand(monkeypatch, tmp_path, capsys) -> None:
+    scewin_dir, fake, script = _restore_setup(monkeypatch, tmp_path, capsys, SAMPLE_EXPORT)
+    restore_point = tmp_path / "nvram.original.txt"
+    restore_point.write_text(SAMPLE_EXPORT.replace("Offset\t=12", "Offset\t=FF"), encoding="utf-8")
+
+    code, _, err = run_cli(capsys, "restore", "--scewin", scewin_dir, "--file", script, "--yes")
+    assert code == 1 and "differ in more than the selected option" in err
+    assert all("/i" not in call for call in fake.calls)
+
+
+def test_restore_no_snapshot_is_the_unchecked_emergency_path(monkeypatch, tmp_path, capsys) -> None:
+    scewin_dir, fake, script = _restore_setup(monkeypatch, tmp_path, capsys, XHCI_OFF)
+    reads = sum(1 for call in fake.calls if "/o" in call)
+
+    code, _, err = run_cli(capsys, "restore", "--scewin", scewin_dir, "--file", script, "--yes", "--no-snapshot")
+    assert code == 0 and "WARNING" in err and "without being compared" in err
+    assert sum(1 for call in fake.calls if "/o" in call) == reads  # the BIOS was not read
+    assert fake.calls[-1][1] == "/i"
 
 
 def test_import_without_a_scewin_folder_is_a_clear_error(tmp_path, capsys, monkeypatch) -> None:
@@ -351,7 +465,7 @@ def test_a_filesystem_error_is_reported_not_raised(export, capsys, monkeypatch) 
 
     monkeypatch.setattr(nvram_editor, "_write_atomically", deny)
     before = export.read_bytes()
-    code, _, err = run_cli(capsys, "set", export, "Adjust VID", "300", "--yes")
+    code, _, err = run_cli(capsys, "set", export, "Adjust VID", "300", "--yes", "--allow-risky")
     assert code == 1 and "access is denied" in err
     assert export.read_bytes() == before
 

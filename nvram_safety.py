@@ -27,6 +27,7 @@ from nvram_structures import OptionField, QuestionBlock, ValueField
 
 # Changing these blindly can leave a machine without input, display or boot, wipe
 # security state, or stress hardware. Matching is case-insensitive on word boundaries.
+# New keywords go at the end: callers show them in this order.
 CONFIRM_KEYWORDS: Tuple[str, ...] = (
     "XHCI",
     "CSM",
@@ -48,6 +49,36 @@ CONFIRM_KEYWORDS: Tuple[str, ...] = (
     "BIOS Lock",
     "Flash Protection",
     "Erase",
+    # Spellings the word-boundary match would otherwise miss.
+    "dTPM",
+    "SecureBoot",
+    "Security Device",
+    # Storage mode: switching AHCI/RAID/VMD under an installed system leaves it unbootable.
+    "SATA Mode",
+    "SATA Type",
+    "RAID",
+    "VMD",
+    # Address space and boot protection.
+    "Above 4G",
+    "Boot Guard",
+    "Password",
+    # Clocks, multipliers and overclocking switches.
+    "BCLK",
+    "Ratio",
+    "Pstate",
+    "Overclock",
+    "OC Mode",
+    "PBO",
+    # Voltages that are not called "Voltage".
+    "VID",
+    "Load Line",
+    "LLC",
+    "VDDCR",
+    "VDDIO",
+    "VDDP",
+    "VDDQ",
+    "VCCIN",
+    "VCCSA",
 )
 
 # Worth noticing in the change list, but too common to prompt for.
@@ -58,18 +89,29 @@ NOTE_KEYWORDS: Tuple[str, ...] = (
     "PCI Express",
     "SATA",
     "NVMe",
-    "VMD",
     "Fast Boot",
     "Watchdog",
+    # Cooling and per-core tuning: dozens of questions each, so listed rather than asked about.
+    "Fan",
+    "Thermal",
+    "Precision Boost",
+    "Curve Optimizer",
 )
 
 # SCEWIN appends a '// Move "*" to the desired Option' hint to option lines.
 _INLINE_COMMENT = re.compile(r"\s//")
+# A question header as the parser accepts it (live, or commented out with ``//``), and anything
+# else that looks like one. ``//`` is the only comment marker SCEWIN knows; a header behind
+# ``#``, ``;`` or a single ``/`` is not a comment to it, so such a line must not pass unnoticed.
+_ACCEPTED_HEADER = re.compile(r"^[ \t]*(?://[ \t]*)?Setup\s+Question\s*=", re.IGNORECASE)
+_HEADER_LIKE = re.compile(r"^[^A-Za-z0-9]*Setup\s+Question\s*=", re.IGNORECASE)
 
 
 def _compile(keywords: Iterable[str]) -> Tuple[Tuple[str, "re.Pattern[str]"], ...]:
     return tuple(
-        (keyword, re.compile(rf"(?<![A-Za-z0-9]){re.escape(keyword)}(?![A-Za-z])", re.IGNORECASE))
+        # A plural still counts ("DRAM Voltages", "Power Limits"); any other letter after the
+        # keyword does not ("Video" is not VID, "Erased" is not Erase).
+        (keyword, re.compile(rf"(?<![A-Za-z0-9]){re.escape(keyword)}(?:e?s)?(?![A-Za-z])", re.IGNORECASE))
         for keyword in keywords
     )
 
@@ -111,11 +153,11 @@ def option_text(field: OptionField) -> str:
 
 
 def current_setting(block: QuestionBlock) -> Optional[str]:
-    """Describe a block's current value, e.g. ``Value <3>`` or ``[01]Enabled``."""
+    """Describe a block's current value: ``Value <3>``, ``Value 0x1A (26)`` or ``[01]Enabled``."""
 
     for field in block.fields:
         if isinstance(field, ValueField):
-            return f"Value <{field.value}>"
+            return field.describe()
     for field in block.fields:
         if isinstance(field, OptionField) and field.selected:
             return option_text(field)
@@ -240,13 +282,19 @@ def _mask_line(line: str) -> str:
     return text
 
 
-def structural_changes(reference_text: str, candidate_text: str) -> List[str]:
+def structural_changes(
+    reference_text: str, candidate_text: str, *, allow_newly_active: bool = False
+) -> List[str]:
     """Describe live questions whose text differs in more than the selected option or number.
 
     Hand edits to ``Offset``, ``Width``, ``Token``, added or removed options, string values and
     so on do not show up in :func:`diff_blocks`, which only compares the current setting, yet
     SCEWIN would write them. Questions that are live in the candidate but were not live in the
-    reference (new, or un-commented) are reported too.
+    reference (new, or un-commented) are reported too, unless ``allow_newly_active`` is set.
+
+    ``allow_newly_active`` is for a restore: which questions SCEWIN exports as active can depend
+    on other settings, so an untouched restore point may hold questions the BIOS hides right
+    now. They are still listed as changes (``<none> -> ...``) by :func:`diff_blocks`.
     """
 
     reference = _keyed(find_blocks(reference_text)[0])
@@ -255,7 +303,8 @@ def structural_changes(reference_text: str, candidate_text: str) -> List[str]:
         label = f"'{block.name}' (Token {block.token or 'none'})"
         before = reference.get(key)
         if before is None:
-            problems.append(f"{label} was not an active question in the baseline")
+            if not allow_newly_active:
+                problems.append(f"{label} was not an active question in the baseline")
             continue
         old = [_mask_line(line) for line in before.body.splitlines()]
         new = [_mask_line(line) for line in block.body.splitlines()]
@@ -283,6 +332,13 @@ def preflight_issues(text: str) -> List[str]:
 
     if rebuild_text(blocks, trailing_text=trailing) != text:
         issues.append("The file does not round-trip through the parser; refusing to import it.")
+
+    for number, line in enumerate(text.split("\n"), start=1):
+        if _HEADER_LIKE.match(line) and not _ACCEPTED_HEADER.match(line):
+            issues.append(
+                f"Line {number} looks like a 'Setup Question' behind something other than '//' "
+                f"({line.strip()[:60]!r}). Only '//' comments a question out."
+            )
 
     for block in blocks:
         if block.is_commented:

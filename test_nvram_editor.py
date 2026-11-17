@@ -15,7 +15,7 @@ def test_find_blocks_parses_help_and_missing_help() -> None:
 [01]*On
 
    Setup Question = SpacedHelp
-;   Help    String=Second help entry
+//   Help    String=Second help entry
 Options =*[00]Disabled
 Options =[01]Enabled
 
@@ -70,7 +70,8 @@ def test_parse_and_rebuild_round_trip_preserves_formatting() -> None:
     blocks, trailing_text = nvram_parsing.find_blocks(mixed_format)
     rebuilt = nvram_reconstruction.rebuild_text(blocks, trailing_text=trailing_text)
 
-    assert [block.name for block in blocks] == ["First", "Second", "Third"]
+    # Only "//" starts a comment; "; ..." and "# ..." stay part of the name.
+    assert [block.name for block in blocks] == ["First", "Second    ; spaced inline", "Third\t# hash inline"]
     assert rebuilt == mixed_format
 
 

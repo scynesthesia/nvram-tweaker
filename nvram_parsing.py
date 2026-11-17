@@ -16,36 +16,46 @@ LOGGER = logging.getLogger(__name__)
 
 BLOCK_PATTERN = re.compile(
     r"""
-    (?P<header_line>^\s*(?:[#;/]{0,2}\s*)?Setup\s+Question\s*=\s*(?P<name>[^\r\n]*?))
+    (?P<header_line>^\s*(?://[ \t]*)?Setup\s+Question\s*=\s*(?P<name>[^\r\n]*?))
     (?P<header_ending>\r?\n|\r|\n)
     (?P<body>
         (?:
             (?!
-                ^\s*(?:[#;/]{0,2}\s*)?Setup\s+Question\b
+                ^\s*(?://[ \t]*)?Setup\s+Question\b
             )
             [\s\S]
         )*?
     )
-    (?=^\s*(?:[#;/]{0,2}\s*)?Setup\s+Question\b|\Z)
+    (?=^\s*(?://[ \t]*)?Setup\s+Question\b|\Z)
     """,
     re.IGNORECASE | re.MULTILINE | re.VERBOSE,
 )
 HELP_PATTERN = re.compile(
-    r"^\s*(?:[#;/]{0,2}\s*)?Help\s+String\s*=\s*(?P<help>[^\r\n]*)",
+    r"^\s*(?://[ \t]*)?Help\s+String\s*=\s*(?P<help>[^\r\n]*)",
     re.MULTILINE,
 )
 TOKEN_PATTERN = re.compile(
-    r"^\s*(?:[#;/]{0,2}\s*)?Token\s*=\s*(?P<token>.+)",
+    r"^\s*(?://[ \t]*)?Token\s*=\s*(?P<token>.+)",
     re.MULTILINE,
 )
 _NUMBER = r"[+-]?(?:0x[0-9A-Fa-f]+|\d+)"
-# A live numeric line. Real exports use both ``Value =<30>`` and the bare ``Value =0``;
-# the value group is only the number, so edits keep everything else on the line.
-# Anchored to the line start so a commented-out ``// Value =<1>`` is never matched.
+_HEX_NUMBER = r"[+-]?(?:0x)?[0-9A-Fa-f]+"
+# A live numeric line. Real exports write numbers in two forms, and the form is the base:
+#
+#   Value =<30>    in angle brackets: decimal            (501 of 586 in one real export)
+#   Value =1A0     bare:              hexadecimal        (FF5, 3F8, FFFFFFFB, ... and plain 0)
+#
+# The value group is only the number, so edits keep everything else on the line. The pattern
+# is anchored at both ends: at the line start so a commented-out ``// Value =<1>`` is never
+# matched, and at the line end (allowing a trailing ``// comment``) so a number is never
+# matched in part. Half-matching ``3FF`` as ``3`` once turned an edit to 10 into ``10FF``.
 VALUE_PATTERN = re.compile(
-    r"^[ \t]*Value[ \t]*=[ \t]*(?P<open><)?(?P<value>" + _NUMBER + r")(?(open)>)",
+    r"^[ \t]*Value[ \t]*=[ \t]*(?P<open><)?(?P<value>(?(open)" + _NUMBER + r"|" + _HEX_NUMBER + r"))(?(open)>)"
+    r"(?=[ \t]*(?://[^\r\n]*)?\r*$)",
     re.MULTILINE,
 )
+# Any live ``Value =`` line, readable or not (see :func:`has_unreadable_value`).
+VALUE_LINE_PATTERN = re.compile(r"^[ \t]*Value[ \t]*=", re.MULTILINE)
 # A live option line. Lines starting with a comment marker are not options.
 OPTION_LINE_PATTERN = re.compile(
     r"(?P<prefix>\s*(?:Options?)?\s*=?\s*)?"
@@ -62,13 +72,37 @@ NUMERIC_INPUT_PATTERN = re.compile(r"^[+-]?(?:0x[0-9A-Fa-f]+|\d+)$")
 SETUP_BOUNDARY_PATTERN = re.compile(r"setup\s+question", re.IGNORECASE)
 
 
-def parse_number(raw: str) -> int:
-    """Parse a SCEWIN number: decimal (leading zeros allowed) or ``0x`` hexadecimal."""
+def parse_number(raw: str, base: int = 10) -> int:
+    """Parse a number in ``base`` (leading zeros allowed); a ``0x`` prefix always means hexadecimal."""
 
     cleaned = raw.strip()
     if "x" in cleaned.lower():
         return int(cleaned, 16)
-    return int(cleaned, 10)
+    return int(cleaned, base)
+
+
+def value_base(match: "re.Match[str]") -> int:
+    """Base of a :data:`VALUE_PATTERN` match: 10 for ``<N>``, 16 for a bare number."""
+
+    return 10 if match.group("open") else 16
+
+
+def format_value(value: int, base: int) -> str:
+    """A number as it is written in the file for ``base``: ``30`` or, in hexadecimal, ``1E``."""
+
+    return format(value, "X") if base == 16 else str(value)
+
+
+def has_unreadable_value(body: str) -> bool:
+    """True when a question has a live ``Value =`` line this tool cannot read as a number.
+
+    Such a question is shown but never edited: guessing at part of a value is how a wrong
+    number reaches the BIOS.
+    """
+
+    return any(
+        VALUE_LINE_PATTERN.match(line) and not VALUE_PATTERN.match(line) for line in body.splitlines()
+    )
 
 
 def normalize_token(raw: str) -> str:
@@ -112,7 +146,7 @@ def find_blocks(text: str) -> tuple[List[QuestionBlock], str]:
         header_without_leading = header_line[len(leading_whitespace) :]
         header_core, inline_comment = _split_inline_comment(header_without_leading)
         setup_match = re.match(
-            r"(?P<prefix>(?:[#;/]{0,2}\s*)?Setup\s+Question\s*=\s*)(?P<name>.*)",
+            r"(?P<prefix>(?://[ \t]*)?Setup\s+Question\s*=\s*)(?P<name>.*)",
             header_core,
             re.IGNORECASE,
         )
@@ -129,7 +163,7 @@ def find_blocks(text: str) -> tuple[List[QuestionBlock], str]:
         min_value = _parse_range_value(min_match, "min")
         max_value = _parse_range_value(max_match, "max")
         width = _parse_width(WIDTH_PATTERN.search(body))
-        is_commented = header_without_leading[:1] in ("#", ";", "/")
+        is_commented = header_without_leading.startswith("//")
         cursor = match.end()
         cleaned_token: Optional[str] = None
         if token_match:
@@ -171,15 +205,15 @@ def _extract_leading_whitespace(line: str) -> str:
 
 
 def _split_inline_comment(line: str) -> tuple[str, str]:
-    """Split a trailing ``// ...``, ``; ...`` or ``# ...`` comment off a header line.
+    """Split a trailing ``// ...`` comment off a header line.
 
-    SCEWIN itself only writes ``//`` comments. A marker only starts a comment when
-    whitespace comes before it, and ``#`` / ``;`` also need whitespace after them.
-    Question names contain these characters ("PCIe/GFX Lanes",
-    "Clock Power Management(CLKREQ#)", "Boot Option #1") and must not be cut short.
+    ``//`` is the only comment marker SCEWIN knows, so it is the only one honoured here:
+    treating ``#`` or ``;`` as comments would hide text from the import checks that
+    SCEWIN may still read. The marker only starts a comment when whitespace comes
+    before it; question names contain slashes ("PCIe/GFX Lanes") and must not be cut short.
     """
 
-    comment_match = re.search(r"(\s+(?://.*|[#;](?:\s.*)?))$", line)
+    comment_match = re.search(r"(\s+//.*)$", line)
     if not comment_match:
         return line, ""
     start_index = comment_match.start(1)
@@ -256,9 +290,11 @@ def _parse_fields(body: str) -> List[BlockField]:
 
         value_match = VALUE_PATTERN.search(line)
         if value_match:
+            base = value_base(value_match)
             fields.append(
                 ValueField(
-                    value=parse_number(value_match.group("value")),
+                    value=parse_number(value_match.group("value"), base),
+                    base=base,
                     line_ending="\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else ""),
                 )
             )
