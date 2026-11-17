@@ -136,7 +136,9 @@ def test_full_export_round_trips_and_saves_byte_identically(tmp_path: Path) -> N
     # Confirmation prompts must stay rare, or people learn to click through them.
     live = [b for b in manager.blocks if not b.is_commented]
     confirm = nvram_safety.find_risky_blocks(live)
-    assert len(confirm) / len(live) < 0.12, f"{len(confirm)} of {len(live)} questions ask for confirmation"
+    share = len(confirm) / len(live)
+    print(f"confirm tier: {len(confirm)} of {len(live)} active questions ({share:.1%})")
+    assert share < 0.15, f"{len(confirm)} of {len(live)} questions ask for confirmation"
 
     # Every parsed name must equal the raw text of its header line (no truncation).
     raw_names = re.findall(

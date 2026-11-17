@@ -108,11 +108,44 @@ def test_warnings_do_not_count_as_errors() -> None:
         ("CPU Core Voltage", ["Voltage"]),
         ("Primary Video Adaptor", ["Primary Video"]),
         ("BIOS CSM/UEFI Mode", ["CSM"]),
+        # plurals and spellings without a word boundary
+        ("DRAM Voltages", ["Voltage"]),
+        ("Package Power Limits", ["Power Limit"]),
+        ("dTPM", ["dTPM"]),
+        ("SecureBoot", ["SecureBoot"]),
+        ("Security Device Support", ["Security Device"]),
+        # storage mode: the wrong one leaves an installed system unbootable
+        ("SATA Mode Selection", ["SATA Mode"]),
+        ("OnChip SATA Type", ["SATA Type"]),
+        ("NVMe RAID mode", ["RAID"]),
+        ("Enable VMD controller", ["VMD"]),
+        # clocks, multipliers, overclocking, voltages by another name
+        ("Above 4G Decoding", ["Above 4G"]),
+        ("CPU Core Ratio", ["Ratio"]),
+        ("BCLK Frequency", ["BCLK"]),
+        ("Custom Pstate0", ["Pstate"]),
+        ("Pstate0 VID", ["Pstate", "VID"]),
+        ("Adjust VID Value", ["VID"]),
+        ("Load Line Calibration", ["Load Line"]),
+        ("Adjust VRM SVI2 - VDDCR_CPU", ["VDDCR"]),
+        ("Adjust MEM VDDIO Value", ["VDDIO"]),
+        ("SOC OVERCLOCK VID", ["Overclock", "VID"]),
+        ("OC Mode", ["OC Mode"]),
+        ("PBO Limits", ["PBO"]),
+        ("Boot Guard", ["Boot Guard"]),
+        ("Administrator Password", ["Password"]),
+        # a keyword inside a longer word is not a match
+        ("Primary Video Adaptor Videos", ["Primary Video"]),
+        ("Video Memory", []),
+        ("Erased Blocks", []),
+        ("Operation Mode", []),
         # note-level words never ask for confirmation
         ("Legacy USB Support", []),
         ("Native ASPM", []),
-        ("OnChip SATA Type", []),
+        ("SATA Port 0 Hot Plug", []),
         ("Fan Start Temperature", []),
+        ("Precision Boost Overdrive Scalar", []),
+        ("Core 0 Curve Optimizer Sign", []),
         ("Busy Wait", []),
     ],
 )
@@ -128,7 +161,12 @@ def test_risky_keywords(name: str, expected: List[str]) -> None:
         ("OnChip SATA Type", ["SATA"]),
         ("PCIE PORT 0", ["PCIe"]),
         ("XHCI Hand-off", []),
-        ("Fan Start Temperature", []),
+        ("Fan Start Temperature", ["Fan"]),
+        ("CPU Fan1 Smart Fan Control", ["Fan"]),
+        ("Platform Thermal Throttle Limit", ["Thermal"]),
+        ("Precision Boost Overdrive", ["Precision Boost"]),
+        ("All Core Curve Optimizer Magnitude", ["Curve Optimizer"]),
+        ("Busy Wait", []),
     ],
 )
 def test_noted_keywords(name: str, expected: List[str]) -> None:
@@ -136,8 +174,8 @@ def test_noted_keywords(name: str, expected: List[str]) -> None:
 
 
 def test_diff_marks_note_level_changes_without_flagging_risk() -> None:
-    before = "Setup Question = OnChip SATA Type\nOptions =*[00]AHCI\n         [01]RAID\n"
-    after = "Setup Question = OnChip SATA Type\nOptions =[00]AHCI\n         *[01]RAID\n"
+    before = "Setup Question = OnChip SATA Channel\nOptions =*[00]AHCI\n         [01]RAID\n"
+    after = "Setup Question = OnChip SATA Channel\nOptions =[00]AHCI\n         *[01]RAID\n"
     (change,) = nvram_safety.diff_texts(before, after)
     assert change.risk_keywords == () and change.note_keywords == ("SATA",)
     assert "[note: SATA]" in change.format() and "RISK" not in change.format()

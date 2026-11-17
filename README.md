@@ -31,10 +31,19 @@ The exe is not code-signed, so Windows SmartScreen may warn about it.
 
 **Risk levels.** Questions whose names contain certain words are treated in two tiers (the lists are in [`nvram_safety.py`](nvram_safety.py)):
 
-- **Confirm**: `XHCI`, `CSM`, `Secure Boot`, `TPM`/`fTPM`/`PTT`, `iGPU`/`IGD`, `Primary Display`/`Primary Video`, `Voltage`/`VCore`, power limits (`Power Limit`, `PL1`, `PL2`, `IccMax`, `Current Limit`), `BIOS Lock`, `Flash Protection`, `Erase`. The GUI shows a confirmation dialog and the CLI needs you to type `YES` (or pass `--allow-risky`).
-- **Note**: `USB`, `SATA`, `PCIe`, `ASPM`, `NVMe`, `VMD`, `Fast Boot`, `Watchdog`. Marked `[note: ...]` in the change list, with no extra prompt. These words appear in a quarter of all question names, so asking about each would only teach people to click through.
+- **Confirm**:
+  - input, display and boot: `XHCI`, `CSM`, `iGPU`/`IGD`, `Primary Display`/`Primary Video`, `Above 4G`;
+  - storage mode (the wrong one leaves an installed system unbootable): `SATA Mode`, `SATA Type`, `RAID`, `VMD`;
+  - security state: `Secure Boot`/`SecureBoot`, `TPM`/`fTPM`/`dTPM`/`PTT`, `Security Device`, `Boot Guard`, `Password`, `BIOS Lock`, `Flash Protection`, `Erase`;
+  - voltages: `Voltage`, `VCore`, `VID`, `Load Line`/`LLC`, and the rails `VDDCR`, `VDDIO`, `VDDP`, `VDDQ`, `VCCIN`, `VCCSA`;
+  - power, clocks and overclocking: `Power Limit`, `PL1`, `PL2`, `IccMax`, `Current Limit`, `BCLK`, `Ratio`, `Pstate`, `Overclock`, `OC Mode`, `PBO`.
 
-On one real export (1,819 active questions) the confirm tier covers 168 questions (9%).
+  The GUI shows a confirmation dialog and the CLI needs you to type `YES` (or pass `--allow-risky`).
+- **Note**: `USB`, `SATA`, `PCIe`, `ASPM`, `NVMe`, `Fast Boot`, `Watchdog`, `Fan`, `Thermal`, `Precision Boost`, `Curve Optimizer`. Marked `[note: ...]` in the change list, with no extra prompt. These words appear in a quarter of all question names, so asking about each would only teach people to click through.
+
+A keyword matches as a whole word, and its plural counts too (`DRAM Voltages`); `Video` is not `VID`.
+
+On one real export (1,819 active questions) the confirm tier covers 226 questions (12%). The full-export test fails above 15%, so the list cannot quietly grow into something people click through.
 
 ## Quick start (GUI)
 

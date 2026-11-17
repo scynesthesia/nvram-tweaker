@@ -27,6 +27,7 @@ from nvram_structures import OptionField, QuestionBlock, ValueField
 
 # Changing these blindly can leave a machine without input, display or boot, wipe
 # security state, or stress hardware. Matching is case-insensitive on word boundaries.
+# New keywords go at the end: callers show them in this order.
 CONFIRM_KEYWORDS: Tuple[str, ...] = (
     "XHCI",
     "CSM",
@@ -48,6 +49,36 @@ CONFIRM_KEYWORDS: Tuple[str, ...] = (
     "BIOS Lock",
     "Flash Protection",
     "Erase",
+    # Spellings the word-boundary match would otherwise miss.
+    "dTPM",
+    "SecureBoot",
+    "Security Device",
+    # Storage mode: switching AHCI/RAID/VMD under an installed system leaves it unbootable.
+    "SATA Mode",
+    "SATA Type",
+    "RAID",
+    "VMD",
+    # Address space and boot protection.
+    "Above 4G",
+    "Boot Guard",
+    "Password",
+    # Clocks, multipliers and overclocking switches.
+    "BCLK",
+    "Ratio",
+    "Pstate",
+    "Overclock",
+    "OC Mode",
+    "PBO",
+    # Voltages that are not called "Voltage".
+    "VID",
+    "Load Line",
+    "LLC",
+    "VDDCR",
+    "VDDIO",
+    "VDDP",
+    "VDDQ",
+    "VCCIN",
+    "VCCSA",
 )
 
 # Worth noticing in the change list, but too common to prompt for.
@@ -58,9 +89,13 @@ NOTE_KEYWORDS: Tuple[str, ...] = (
     "PCI Express",
     "SATA",
     "NVMe",
-    "VMD",
     "Fast Boot",
     "Watchdog",
+    # Cooling and per-core tuning: dozens of questions each, so listed rather than asked about.
+    "Fan",
+    "Thermal",
+    "Precision Boost",
+    "Curve Optimizer",
 )
 
 # SCEWIN appends a '// Move "*" to the desired Option' hint to option lines.
@@ -74,7 +109,9 @@ _HEADER_LIKE = re.compile(r"^[^A-Za-z0-9]*Setup\s+Question\s*=", re.IGNORECASE)
 
 def _compile(keywords: Iterable[str]) -> Tuple[Tuple[str, "re.Pattern[str]"], ...]:
     return tuple(
-        (keyword, re.compile(rf"(?<![A-Za-z0-9]){re.escape(keyword)}(?![A-Za-z])", re.IGNORECASE))
+        # A plural still counts ("DRAM Voltages", "Power Limits"); any other letter after the
+        # keyword does not ("Video" is not VID, "Erased" is not Erase).
+        (keyword, re.compile(rf"(?<![A-Za-z0-9]){re.escape(keyword)}(?:e?s)?(?![A-Za-z])", re.IGNORECASE))
         for keyword in keywords
     )
 

@@ -71,7 +71,7 @@ def test_list_json_is_machine_readable(export, capsys) -> None:
         "kind": "value",
         "setting": "Value <0>",
         "width": 2,
-        "risk": [],
+        "risk": ["VID"],
         "note": [],
     }
 
@@ -129,14 +129,14 @@ def test_dry_run_prints_the_change_and_touches_nothing(export, capsys) -> None:
 
 def test_set_without_yes_refuses_when_not_interactive(export, capsys) -> None:
     before = export.read_bytes()
-    code, _, err = run_cli(capsys, "set", export, "Adjust VID", "300")
+    code, _, err = run_cli(capsys, "set", export, "Adjust VID", "300", "--allow-risky")
     assert code == 1 and "pass --yes" in err
     assert export.read_bytes() == before
 
 
 def test_set_with_yes_changes_exactly_one_line_and_keeps_a_bak(export, capsys) -> None:
     before = export.read_bytes()
-    code, out, _ = run_cli(capsys, "set", export, "Adjust VID", "300", "--yes")
+    code, out, _ = run_cli(capsys, "set", export, "Adjust VID", "300", "--yes", "--allow-risky")
     assert code == 0 and "Saved" in out
     assert changed_lines(before, export.read_bytes()) == [(b"Value\t=<0>\r", b"Value\t=<300>\r")]
     assert (export.parent / "nvram.txt.bak").read_bytes() == before
@@ -145,8 +145,8 @@ def test_set_with_yes_changes_exactly_one_line_and_keeps_a_bak(export, capsys) -
 def test_saving_a_file_never_creates_the_restore_point(export, capsys) -> None:
     """The restore point is what 'restore' writes to the BIOS, so only the BIOS may supply it."""
 
-    run_cli(capsys, "set", export, "Adjust VID", "300", "--yes")
-    run_cli(capsys, "set", export, "Adjust VID", "400", "--yes")
+    run_cli(capsys, "set", export, "Adjust VID", "300", "--yes", "--allow-risky")
+    run_cli(capsys, "set", export, "Adjust VID", "400", "--yes", "--allow-risky")
     assert not (export.parent / "nvram.original.txt").exists()
     assert b"<300>" in (export.parent / "nvram.txt.bak").read_bytes()  # .bak is the previous save
 
@@ -239,18 +239,18 @@ def test_ambiguous_match_is_refused_when_scripted(export, capsys) -> None:
 
 
 def test_token_narrows_an_ambiguous_match(export, capsys) -> None:
-    code, _, _ = run_cli(capsys, "set", export, "Value", "5", "--token", "0x18", "--yes")
+    code, _, _ = run_cli(capsys, "set", export, "Value", "5", "--token", "0x18", "--yes", "--allow-risky")
     assert code == 0
     assert b"Value\t=<5>" in export.read_bytes()
 
 
 def test_all_changes_every_match(export, capsys) -> None:
-    code, out, _ = run_cli(capsys, "set", export, "Value", "5", "--all", "--yes")
+    code, out, _ = run_cli(capsys, "set", export, "Value", "5", "--all", "--yes", "--allow-risky")
     assert code == 0 and "3 setting(s) will change" in out
 
 
 def test_interactive_choice_among_several_matches(export, capsys) -> None:
-    code, out, _ = run_cli(capsys, "set", export, "Value", "5", interactive=True, answers=["2", "y"])
+    code, out, _ = run_cli(capsys, "set", export, "Value", "5", interactive=True, answers=["2", "YES", "y"])
     assert code == 0 and "1 setting(s) will change" in out
     assert b"Value\t=<5>" in export.read_bytes()
 
@@ -465,7 +465,7 @@ def test_a_filesystem_error_is_reported_not_raised(export, capsys, monkeypatch) 
 
     monkeypatch.setattr(nvram_editor, "_write_atomically", deny)
     before = export.read_bytes()
-    code, _, err = run_cli(capsys, "set", export, "Adjust VID", "300", "--yes")
+    code, _, err = run_cli(capsys, "set", export, "Adjust VID", "300", "--yes", "--allow-risky")
     assert code == 1 and "access is denied" in err
     assert export.read_bytes() == before
 
