@@ -11,10 +11,23 @@ from typing import List, Union
 
 @dataclass(frozen=True)
 class ValueField:
-    """Represents a ``Value = <X>`` line inside a block."""
+    """Represents a numeric ``Value`` line inside a block.
+
+    ``base`` is how the file writes the number: 10 for ``Value =<30>``, 16 for the bare
+    ``Value =1E``. ``value`` is always the number itself.
+    """
 
     value: int
     line_ending: str = "\n"
+    base: int = 10
+
+    def describe(self) -> str:
+        """``Value <30>`` for a decimal setting, ``Value 0x1E (30)`` for a hexadecimal one."""
+
+        if self.base == 16:
+            sign = "-" if self.value < 0 else ""
+            return f"Value {sign}0x{abs(self.value):X} ({self.value})"
+        return f"Value <{self.value}>"
 
 
 @dataclass(frozen=True)

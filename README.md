@@ -70,7 +70,7 @@ python nvram_tweaker_cli.py set  nvram.txt "XHCI" "Enabled" --yes --allow-risky
 
 **Matching.** `QUERY` matches any part of a question name (case-insensitive); `--exact` requires the whole name. `Boot Option #1` therefore also matches `#10` to `#13`; use `--exact`. `--token` takes the hexadecimal token printed in the export; `7D1`, `0x7d1` and `007D1` are the same. When several questions match, an interactive run asks which; a script must narrow it with `--token`/`--exact` or pass `--all` (it is never guessed).
 
-**What `set` does.** The mode is chosen per question: a number for numeric questions, part of an option's text (`Disabled`) for the others (`--mode value|option` forces it). Numbers are decimal, or hexadecimal with `0x`. `set` edits the *file*; use `import` to write it to the BIOS.
+**What `set` does.** The mode is chosen per question: a number for numeric questions, part of an option's text (`Disabled`) for the others (`--mode value|option` forces it). Numbers you type are decimal, or hexadecimal with `0x`, whichever way the file stores the setting (see [About the file format](#about-the-file-format)). `set` edits the *file*; use `import` to write it to the BIOS.
 
 **Scripting rules.** Nothing is written without confirmation: an interactive run asks; a script must pass `--yes`, and changes to confirm-level settings also need `--allow-risky` (`--yes` alone never covers them). `--dry-run` prints the change list and asks nothing. Exit codes: `0` success, `1` error or cancelled, `2` ambiguous match or bad usage.
 
@@ -123,7 +123,7 @@ Without `--scewin` the current folder and the app folder (and a `SCEWIN/<version
 Notes from real exports (AMISCE 5.05.01.0002), useful if you write your own tooling:
 
 - Lines end in `\r\n`, but a few header lines end in `\r\r\n`. The `HIICrc32=` line is on line 6, after a `//` comment block. Files can contain non-UTF-8 bytes (`85°C`), so they are read and written as latin-1 when UTF-8 fails.
-- A numeric setting is `Value =<30>` or the bare `Value =0`; both occur. `Width =01` is its size in bytes. Real exports contain no `Min`/`Max` lines.
+- A numeric setting comes in two forms, and the form is the base: `Value =<30>` (angle brackets) is **decimal**, the bare `Value =1A0` is **hexadecimal** (one real export has 501 of the first and 85 of the second, among them `FF5`, `3F8` and `FFFFFFFB`). A bare line may end in a comment (`Value =0	// Enabled = 1, Disabled = 0`). The tool reads a number only when it is the whole value, writes it back in the base its line uses, and shows hexadecimal settings as `Value 0x64 (100)`. A `Value` line it cannot read that way is listed but read-only. `Width =01` is the size in bytes. Real exports contain no `Min`/`Max` lines.
 - `Setup Question = ...` headers may contain `/`, `#`, `;` and `()` as part of the name (`PCIe/GFX Lanes Configuration`, `Boot Option #1`); only whitespace followed by `//` starts a comment.
 - Tokens are hexadecimal without a prefix and are not unique across the file, and neither are names (one real export has 290 distinct names that appear more than once).
 

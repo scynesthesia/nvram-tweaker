@@ -39,13 +39,23 @@ TOKEN_PATTERN = re.compile(
     re.MULTILINE,
 )
 _NUMBER = r"[+-]?(?:0x[0-9A-Fa-f]+|\d+)"
-# A live numeric line. Real exports use both ``Value =<30>`` and the bare ``Value =0``;
-# the value group is only the number, so edits keep everything else on the line.
-# Anchored to the line start so a commented-out ``// Value =<1>`` is never matched.
+_HEX_NUMBER = r"[+-]?(?:0x)?[0-9A-Fa-f]+"
+# A live numeric line. Real exports write numbers in two forms, and the form is the base:
+#
+#   Value =<30>    in angle brackets: decimal            (501 of 586 in one real export)
+#   Value =1A0     bare:              hexadecimal        (FF5, 3F8, FFFFFFFB, ... and plain 0)
+#
+# The value group is only the number, so edits keep everything else on the line. The pattern
+# is anchored at both ends: at the line start so a commented-out ``// Value =<1>`` is never
+# matched, and at the line end (allowing a trailing ``// comment``) so a number is never
+# matched in part. Half-matching ``3FF`` as ``3`` once turned an edit to 10 into ``10FF``.
 VALUE_PATTERN = re.compile(
-    r"^[ \t]*Value[ \t]*=[ \t]*(?P<open><)?(?P<value>" + _NUMBER + r")(?(open)>)",
+    r"^[ \t]*Value[ \t]*=[ \t]*(?P<open><)?(?P<value>(?(open)" + _NUMBER + r"|" + _HEX_NUMBER + r"))(?(open)>)"
+    r"(?=[ \t]*(?://[^\r\n]*)?\r*$)",
     re.MULTILINE,
 )
+# Any live ``Value =`` line, readable or not (see :func:`has_unreadable_value`).
+VALUE_LINE_PATTERN = re.compile(r"^[ \t]*Value[ \t]*=", re.MULTILINE)
 # A live option line. Lines starting with a comment marker are not options.
 OPTION_LINE_PATTERN = re.compile(
     r"(?P<prefix>\s*(?:Options?)?\s*=?\s*)?"
@@ -62,13 +72,37 @@ NUMERIC_INPUT_PATTERN = re.compile(r"^[+-]?(?:0x[0-9A-Fa-f]+|\d+)$")
 SETUP_BOUNDARY_PATTERN = re.compile(r"setup\s+question", re.IGNORECASE)
 
 
-def parse_number(raw: str) -> int:
-    """Parse a SCEWIN number: decimal (leading zeros allowed) or ``0x`` hexadecimal."""
+def parse_number(raw: str, base: int = 10) -> int:
+    """Parse a number in ``base`` (leading zeros allowed); a ``0x`` prefix always means hexadecimal."""
 
     cleaned = raw.strip()
     if "x" in cleaned.lower():
         return int(cleaned, 16)
-    return int(cleaned, 10)
+    return int(cleaned, base)
+
+
+def value_base(match: "re.Match[str]") -> int:
+    """Base of a :data:`VALUE_PATTERN` match: 10 for ``<N>``, 16 for a bare number."""
+
+    return 10 if match.group("open") else 16
+
+
+def format_value(value: int, base: int) -> str:
+    """A number as it is written in the file for ``base``: ``30`` or, in hexadecimal, ``1E``."""
+
+    return format(value, "X") if base == 16 else str(value)
+
+
+def has_unreadable_value(body: str) -> bool:
+    """True when a question has a live ``Value =`` line this tool cannot read as a number.
+
+    Such a question is shown but never edited: guessing at part of a value is how a wrong
+    number reaches the BIOS.
+    """
+
+    return any(
+        VALUE_LINE_PATTERN.match(line) and not VALUE_PATTERN.match(line) for line in body.splitlines()
+    )
 
 
 def normalize_token(raw: str) -> str:
@@ -256,9 +290,11 @@ def _parse_fields(body: str) -> List[BlockField]:
 
         value_match = VALUE_PATTERN.search(line)
         if value_match:
+            base = value_base(value_match)
             fields.append(
                 ValueField(
-                    value=parse_number(value_match.group("value")),
+                    value=parse_number(value_match.group("value"), base),
+                    base=base,
                     line_ending="\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else ""),
                 )
             )

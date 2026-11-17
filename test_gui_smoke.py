@@ -121,6 +121,21 @@ def test_four_byte_value_uses_the_text_field(gui, tmp_path) -> None:
     assert "0 to 4294967295" in dpg.get_value("value_range_hint")
 
 
+def test_a_hexadecimal_setting_says_so_and_is_written_back_in_hexadecimal(gui, tmp_path) -> None:
+    path = load(gui, FIXTURE, tmp_path)
+    idx = select(gui, "CAKE CRC perf bounds")  # bare "Value =64": 0x64, Width=04
+    assert "0x64 (100)" in dpg.get_value("value_hex_hint")
+    assert dpg.get_value("value_input_text") == "0x64"
+
+    dpg.set_value("value_input_text", "200")
+    gui.on_value_change(None, None, {"block_index": idx, "input_tag": "value_input_text"})
+    assert "Value\t=C8\r\n" in gui.state.blocks[idx].body
+
+    select(gui, "Adjust APU VDDP Value")  # "Value =<0>": decimal, no hint
+    assert not dpg.does_item_exist("value_hex_hint")
+    assert path.exists()
+
+
 # --- risk confirmation -----------------------------------------------------
 
 

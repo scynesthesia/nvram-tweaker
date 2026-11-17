@@ -11,9 +11,9 @@ from tkinter import Tk, filedialog
 
 import nvram_settings
 from nvram_editor import NVRAMManager, apply_changes
-from nvram_parsing import OPTION_LINE_PATTERN, VALUE_PATTERN, validate_numeric_input
+from nvram_parsing import OPTION_LINE_PATTERN, VALUE_PATTERN, has_unreadable_value, validate_numeric_input
 from nvram_safety import current_setting, find_risky_blocks
-from nvram_structures import QuestionBlock
+from nvram_structures import QuestionBlock, ValueField
 from nvram_version import __version__
 from scewin_runner import (
     DEFAULT_SCRIPT_NAME,
@@ -278,13 +278,23 @@ def rebuild_controls(block_index: int, block: QuestionBlock) -> None:
 
     dpg.delete_item("control_region", children_only=True)
 
-    value_match = VALUE_PATTERN.search(block.body)
-    if value_match:
-        current_value_text = value_match.group("value")
+    if has_unreadable_value(block.body):
+        dpg.add_text(
+            "This question's Value line is not a number this tool can read, so it is read-only here.",
+            parent="control_region",
+            tag="value_unreadable_hint",
+        )
+        return
+
+    value_field = next((f for f in block.fields if isinstance(f, ValueField)), None)
+    if value_field is not None:
+        # The file writes bare numbers in hexadecimal; the input always takes decimal or 0x-hex.
+        is_hex = value_field.base == 16
+        current_value_text = f"0x{value_field.value:X}" if is_hex and value_field.value >= 0 else str(value_field.value)
         low, high = block.value_bounds()
         # Dear PyGui's integer widget is 32-bit signed; wider settings use the text field.
         fits_int32 = (high is None or high <= INT32_MAX) and (low is None or low >= 0)
-        use_numeric_input = current_value_text.isdigit() and fits_int32
+        use_numeric_input = value_field.value >= 0 and fits_int32
 
         with dpg.group(parent="control_region", horizontal=True):
             if use_numeric_input:
@@ -296,7 +306,7 @@ def rebuild_controls(block_index: int, block: QuestionBlock) -> None:
                     max_value=high if high is not None else INT32_MAX,
                     min_clamped=True,
                     max_clamped=True,
-                    default_value=int(current_value_text),
+                    default_value=value_field.value,
                     width=180,
                 )
                 bind_mono_font(input_tag)
@@ -318,6 +328,12 @@ def rebuild_controls(block_index: int, block: QuestionBlock) -> None:
         if low is not None or high is not None:
             size = f" ({block.width}-byte setting)" if block.width else ""
             dpg.add_text(f"Allowed range: {low} to {high}{size}.", parent="control_region", tag="value_range_hint")
+        if is_hex:
+            dpg.add_text(
+                f"Stored in hexadecimal in the file: {value_field.describe()}.",
+                parent="control_region",
+                tag="value_hex_hint",
+            )
         dpg.add_text(
             "Enter decimal values or 0x-prefixed hexadecimal when using the text field.",
             parent="control_region",
@@ -718,7 +734,7 @@ def on_batch_value_apply(sender: int, app_data: object, user_data: Optional[Dict
 
     for idx in state.selected_indices:
         block = state.blocks[idx]
-        if not VALUE_PATTERN.search(block.body):
+        if has_unreadable_value(block.body) or not VALUE_PATTERN.search(block.body):
             skipped.append((block.name, "block does not support numeric values."))
             continue
 

@@ -116,11 +116,11 @@ def option_text(field: OptionField) -> str:
 
 
 def current_setting(block: QuestionBlock) -> Optional[str]:
-    """Describe a block's current value, e.g. ``Value <3>`` or ``[01]Enabled``."""
+    """Describe a block's current value: ``Value <3>``, ``Value 0x1A (26)`` or ``[01]Enabled``."""
 
     for field in block.fields:
         if isinstance(field, ValueField):
-            return f"Value <{field.value}>"
+            return field.describe()
     for field in block.fields:
         if isinstance(field, OptionField) and field.selected:
             return option_text(field)

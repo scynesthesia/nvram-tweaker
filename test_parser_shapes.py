@@ -177,6 +177,73 @@ def test_numbers_are_decimal_unless_hex_prefixed(raw: str, expected: int) -> Non
     assert nvram_parsing.validate_numeric_input(raw)[0] == expected
 
 
+@pytest.mark.parametrize(
+    "line, value, base",
+    [
+        ("Value\t=<30>", 30, 10),  # angle brackets: decimal
+        ("Value =<64>", 64, 10),
+        ("Value = <1>", 1, 10),
+        ("Value\t=0", 0, 16),  # bare: hexadecimal
+        ("Value\t=64", 100, 16),
+        ("Value\t=3FF", 1023, 16),
+        ("Value\t=FF", 255, 16),
+        ("Value\t=1A0", 416, 16),
+        ("Value\t=FFFFFFFB", 0xFFFFFFFB, 16),
+        ("Value\t=0x1A", 26, 16),
+        ("Value\t=0\t// Enabled = 1, Disabled = 0", 0, 16),  # trailing comment, as real exports have
+    ],
+)
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r\r\n", ""])
+def test_value_forms_and_their_base(line: str, value: int, base: int, ending: str) -> None:
+    blocks, _ = nvram_parsing.find_blocks(f"Setup Question = Q\r\nWidth\t=04\r\n{line}{ending}")
+    assert [(f.value, f.base) for f in blocks[0].fields if isinstance(f, ValueField)] == [(value, base)]
+    assert not nvram_parsing.has_unreadable_value(blocks[0].body)
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["Value =10 junk", "Value =3 FF", "Value =<3F>", "Value =<30", "Value =12G", "Value =<30>x", 'Value ="text"'],
+)
+def test_a_value_that_is_not_wholly_a_number_is_never_matched_in_part(line: str) -> None:
+    text = f"Setup Question = Q\nWidth =02\n{line}\n"
+    blocks, _ = nvram_parsing.find_blocks(text)
+    assert not [f for f in blocks[0].fields if isinstance(f, ValueField)]
+    assert nvram_parsing.has_unreadable_value(blocks[0].body)
+    manager = nvram_editor.NVRAMManager()
+    with pytest.raises(ValueError, match="left alone"):
+        manager.update_value(blocks[0], 5)
+
+
+@pytest.mark.parametrize(
+    "line, new_value, expected",
+    [
+        ("Value\t=3FF", 10, "Value\t=A"),  # the audit case: used to become "10FF"
+        ("Value\t=FF", 26, "Value\t=1A"),
+        ("Value\t=0\t// Enabled = 1, Disabled = 0", 1, "Value\t=1\t// Enabled = 1, Disabled = 0"),
+        ("Value\t=<30>", 45, "Value\t=<45>"),
+    ],
+)
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r\r\n"])
+def test_an_edit_writes_the_number_in_the_base_of_its_line(line: str, new_value: int, expected: str, ending: str) -> None:
+    tail = f"{ending}{ending}Setup Question = Next{ending}Value =<1>{ending}"
+    text = f"Setup Question = Q{ending}Width\t=02{ending}{line}{tail}"
+    blocks, trailing = nvram_parsing.find_blocks(text)
+    updated = nvram_editor.NVRAMManager().update_value(blocks[0], new_value)
+    assert rebuild_text([updated, blocks[1]], trailing) == f"Setup Question = Q{ending}Width\t=02{ending}{expected}{tail}"
+    assert [f.value for f in updated.fields if isinstance(f, ValueField)] == [new_value]
+
+
+def test_hexadecimal_settings_are_described_with_both_forms() -> None:
+    blocks, _ = nvram_parsing.find_blocks("Setup Question = A\nValue =FF5\n\nSetup Question = B\nValue =<30>\n")
+    assert [nvram_safety.current_setting(b) for b in blocks] == ["Value 0xFF5 (4085)", "Value <30>"]
+
+
+def test_a_number_with_a_tail_blocks_the_import_check() -> None:
+    before = "Setup Question = Q\nValue =3FF\n"
+    assert nvram_safety.structural_changes(before, "Setup Question = Q\nValue =10FF\n") == []  # a real edit
+    assert nvram_safety.structural_changes(before, "Setup Question = Q\nValue =10 FF\n")
+
+
 def test_zero_padded_value_line_loads() -> None:
     blocks, _ = nvram_parsing.find_blocks("Setup Question = Fan\nValue =<08>\n")
     assert [f.value for f in blocks[0].fields if isinstance(f, ValueField)] == [8]

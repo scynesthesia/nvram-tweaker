@@ -20,9 +20,12 @@ from nvram_parsing import (
     OPTION_LINE_PATTERN,
     VALUE_PATTERN,
     find_blocks,
+    format_value,
+    has_unreadable_value,
     matches_name,
     normalize_token,
     selected_option,
+    value_base,
 )
 from nvram_reconstruction import rebuild_text
 from nvram_structures import OptionField, QuestionBlock, ValueField
@@ -101,13 +104,16 @@ class NVRAMManager:
     def update_value(self, block: QuestionBlock, new_value: int) -> QuestionBlock:
         _require_editable(block)
         body = block.body
+        if has_unreadable_value(body):
+            raise ValueError("The Value line is not a number this tool can read, so it is left alone")
         value_match = VALUE_PATTERN.search(body)
         if not value_match:
             raise ValueError("Block does not contain a Value line")
-        # Replace only the number, so the form (``<30>`` or bare ``30``), the spacing
-        # and the line ending all survive.
+        # Replace only the number, so the form (``<30>`` or the bare hexadecimal ``1E``),
+        # the spacing and the line ending all survive. The number is written in the base
+        # the line already uses.
         start, end = value_match.span("value")
-        new_body = body[:start] + str(new_value) + body[end:]
+        new_body = body[:start] + format_value(new_value, value_base(value_match)) + body[end:]
         new_fields: List[OptionField | ValueField] = []
         for field in block.fields:
             if isinstance(field, ValueField):
@@ -306,9 +312,9 @@ class NVRAMManager:
 def describe_block(block: QuestionBlock) -> str:
     token_display = block.token or "<none>"
     help_text = format_help_text(block.help_string)
-    value_match = VALUE_PATTERN.search(block.body)
-    if value_match:
-        info = f"Value: <{value_match.group('value')}>"
+    value_field = next((f for f in block.fields if isinstance(f, ValueField)), None)
+    if value_field is not None:
+        info = value_field.describe()
     else:
         option = selected_option(block.body)
         info = f"Selected option: {option or '<none>'}"

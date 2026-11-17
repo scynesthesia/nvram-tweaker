@@ -164,6 +164,37 @@ def test_a_bare_value_keeps_its_form(export, capsys) -> None:
     assert changed_lines(before, export.read_bytes()) == [(b"Value\t=0\r", b"Value\t=7\r")]
 
 
+def test_a_bare_value_is_hexadecimal(export, capsys) -> None:
+    """``Value =64`` in a real export is 0x64: asking for 200 must write ``C8``, not ``200``."""
+
+    code, out, _ = run_cli(capsys, "show", export, "CAKE CRC perf bounds")
+    assert code == 0 and "Value 0x64 (100)" in out and "hexadecimal" in out
+
+    before = export.read_bytes()
+    code, out, _ = run_cli(capsys, "set", export, "CAKE CRC perf bounds", "200", "--yes")
+    assert code == 0 and "Value 0x64 (100) -> Value 0xC8 (200)" in out
+    assert changed_lines(before, export.read_bytes()) == [(b"Value\t=64\r", b"Value\t=C8\r")]
+
+
+def test_a_bare_value_with_hex_letters_is_read_whole_and_edited_whole(export, capsys) -> None:
+    export.write_bytes(export.read_bytes().replace(b"Width\t=02\r\nValue\t=0\r\n", b"Width\t=02\r\nValue\t=3FF\r\n"))
+    before = export.read_bytes()
+    code, out, _ = run_cli(capsys, "set", export, "Trcpage", "10", "--yes")
+    assert code == 0 and "Value 0x3FF (1023) -> Value 0xA (10)" in out
+    assert changed_lines(before, export.read_bytes()) == [(b"Value\t=3FF\r", b"Value\t=A\r")]
+
+
+def test_an_unreadable_value_is_listed_but_read_only(export, capsys) -> None:
+    export.write_bytes(export.read_bytes().replace(b"Width\t=02\r\nValue\t=0\r\n", b"Width\t=02\r\nValue\t=3 FF\r\n"))
+    before = export.read_bytes()
+    code, out, _ = run_cli(capsys, "show", export, "Trcpage")
+    assert code == 0 and "read-only" in out
+    for mode in ("auto", "value"):
+        code, _, err = run_cli(capsys, "set", export, "Trcpage", "10", "--yes", "--mode", mode)
+        assert code == 1 and ("read-only" in err or "left alone" in err)
+    assert export.read_bytes() == before
+
+
 # --- set: risky settings -----------------------------------------------------------
 
 

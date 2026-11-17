@@ -27,6 +27,7 @@ import nvram_parsing
 import nvram_safety
 import scewin_runner
 from nvram_reconstruction import rebuild_text
+from nvram_structures import ValueField
 
 FIXTURE = Path(__file__).parent / "tests" / "fixtures" / "real_export_trimmed.txt"
 FULL_EXPORT = os.environ.get("NVRAM_REAL_EXPORT")
@@ -142,6 +143,13 @@ def test_full_export_round_trips_and_saves_byte_identically(tmp_path: Path) -> N
         r"(?m)^[ \t]*(?://[ \t]*)?Setup Question[ \t]*=[ \t]*(.*?)\r?$", original.decode("latin-1")
     )
     assert [b.name for b in manager.blocks] == [name.strip() for name in raw_names]
+
+    # Every live "Value =" line must be read as a whole number (bare ones are hexadecimal).
+    unreadable = [b.name for b in live if nvram_parsing.has_unreadable_value(b.body)]
+    assert unreadable == [], f"Value lines this tool cannot read: {unreadable[:5]}"
+    value_lines = len(re.findall(r"(?m)^Value[ \t]*=", original.decode("latin-1")))
+    parsed = sum(1 for b in live for f in b.fields if isinstance(f, ValueField))
+    assert parsed == value_lines
 
     manager.save(copy, manager.rebuild_text())
 
