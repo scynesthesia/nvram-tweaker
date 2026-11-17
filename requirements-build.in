@@ -1,0 +1,8 @@
+# Top-level requirements for testing and building NVRAM_Tweaker.exe.
+# requirements-build.txt is generated from this file; regenerate it with:
+#
+#   uv pip compile requirements-build.in --universal --generate-hashes \
+#       --python-version 3.10 -o requirements-build.txt
+dearpygui==2.3.1
+pyinstaller==6.22.3
+pytest==9.1.1

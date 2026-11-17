@@ -1,0 +1,470 @@
+"""Run AMI SCEWIN to export, import and restore NVRAM scripts.
+
+nvram-tweaker does not ship SCEWIN. Point it at a folder containing
+``SCEWIN_64.exe``, ``amifldrv64.sys`` and ``amigendrv64.sys`` (for example the
+folder produced by SCEHUB's ``DL_SCEWIN.exe``: https://github.com/ab3lkaizen/SCEHUB).
+
+Workflow
+--------
+1. ``export``: ``SCEWIN_64.exe /o /s <script>``. The first successful export also
+   saves an untouched copy next to the script (``nvram.original.txt``): the
+   restore point.
+2. Edit the script with the CLI editor or the GUI.
+3. ``import``: preflight checks (parser round-trip, exactly one ``*`` per option
+   question, same ``HIICrc32`` header as the restore point), then
+   ``SCEWIN_64.exe /i /s <script>``.
+4. ``restore``: import the restore point to put every setting back.
+
+Every run writes SCEWIN's output to ``log-file.txt`` next to the script and is
+interpreted by :mod:`scewin_diagnostics`.
+
+SCEWIN only runs on Windows with an AMI BIOS and needs administrator rights.
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Callable, Iterable, List, Optional, Sequence
+
+from nvram_cli_prompts import confirm_write
+from nvram_crc import crc_header_mismatch
+from nvram_editor import restore_point_path
+from nvram_safety import SettingChange, diff_texts, missing_questions, preflight_issues, structural_changes
+from scewin_diagnostics import REFERENCE_URL, Diagnosis, diagnose, has_errors
+
+SCEWIN_EXE = "SCEWIN_64.exe"
+REQUIRED_FILES = (SCEWIN_EXE, "amifldrv64.sys", "amigendrv64.sys")
+DEFAULT_SCRIPT_NAME = "nvram.txt"
+LOG_FILE_NAME = "log-file.txt"
+DEFAULT_TIMEOUT_SECONDS = 300
+# Writing can legitimately take long on some boards, and killing SCEWIN mid-write is the one
+# thing worth avoiding; the limit only exists so a hung process does not freeze the GUI forever.
+DEFAULT_IMPORT_TIMEOUT_SECONDS = 1800
+# Diagnosis keys (scewin_diagnostics) for failures that happen before SCEWIN writes anything.
+PRE_WRITE_ERRORS = frozenset({"driver", "error57", "no_hii", "bios_incompatible", "platform_id"})
+PARTIAL_WRITE_WARNING = (
+    "Some settings may already have been written. Do not reboot yet: run 'restore' (or import "
+    "your restore point), then export again and check the result."
+)
+
+RunFunction = Callable[..., "subprocess.CompletedProcess[str]"]
+
+
+class SCEWINError(Exception):
+    """Raised when SCEWIN cannot be run or a safety check blocks the run."""
+
+
+@dataclass(frozen=True)
+class SCEWINResult:
+    action: str
+    command: List[str]
+    returncode: int
+    output: str
+    log_path: Path
+    diagnoses: List[Diagnosis] = field(default_factory=list)
+    restore_point_created: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0 and not has_errors(self.diagnoses)
+
+    @property
+    def may_be_partial(self) -> bool:
+        """True for a failed write that did not clearly stop before touching the BIOS.
+
+        A driver, command-line or compatibility error means SCEWIN never started writing;
+        anything else (write errors, an unexplained non-zero exit) may have written some
+        variables and not others.
+        """
+
+        if self.ok or self.action not in ("import", "restore"):
+            return False
+        errors = [d.key for d in self.diagnoses if d.severity == "error"]
+        return not errors or any(key not in PRE_WRITE_ERRORS for key in errors)
+
+    def summary_lines(self) -> List[str]:
+        status = "succeeded" if self.ok else f"failed (exit code {self.returncode})"
+        lines = [f"SCEWIN {self.action} {status}. Output saved to {self.log_path}."]
+        if self.restore_point_created:
+            lines.append("Saved an untouched restore point of this export.")
+        if self.may_be_partial:
+            lines.append(f"WARNING: {PARTIAL_WRITE_WARNING}")
+        for diagnosis in self.diagnoses:
+            lines.extend(diagnosis.format().splitlines())
+        if self.diagnoses:
+            lines.append(f"More help: {REFERENCE_URL}")
+        return lines
+
+
+def is_admin() -> bool:
+    """Return True when the current process can load SCEWIN's driver."""
+
+    if os.name == "nt":
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+        except (AttributeError, OSError):
+            return False
+    geteuid = getattr(os, "geteuid", None)
+    return bool(geteuid and geteuid() == 0)
+
+
+def missing_files(directory: Path) -> List[str]:
+    return [name for name in REQUIRED_FILES if not (directory / name).is_file()]
+
+
+def find_scewin(directory: Path) -> Path:
+    """Validate a SCEWIN folder and return it, or raise with what is missing."""
+
+    directory = Path(directory).expanduser()
+    if not directory.is_dir():
+        raise SCEWINError(f"SCEWIN folder '{directory}' does not exist.")
+    missing = missing_files(directory)
+    if missing:
+        raise SCEWINError(
+            f"SCEWIN folder '{directory}' is missing: {', '.join(missing)}. "
+            "Get SCEWIN with SCEHUB's DL_SCEWIN.exe (https://github.com/ab3lkaizen/SCEHUB)."
+        )
+    return directory
+
+
+def guess_scewin_dir(candidates: Iterable[Path]) -> Optional[Path]:
+    """Look for a SCEWIN folder in each candidate and in ``<candidate>/SCEWIN/<version>/``."""
+
+    for candidate in candidates:
+        candidate = Path(candidate)
+        options = [candidate]
+        nested = candidate / "SCEWIN"
+        if nested.is_dir():
+            options.extend(sorted((p for p in nested.iterdir() if p.is_dir()), reverse=True))
+        for option in options:
+            if option.is_dir() and not missing_files(option):
+                return option
+    return None
+
+
+def default_scewin_candidates() -> List[Path]:
+    app_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+    return [Path.cwd(), app_dir]
+
+
+class SCEWINRunner:
+    def __init__(
+        self,
+        scewin_dir: Path,
+        *,
+        run: RunFunction = subprocess.run,
+        admin_check: Callable[[], bool] = is_admin,
+        timeout: int = DEFAULT_TIMEOUT_SECONDS,
+        import_timeout: int = DEFAULT_IMPORT_TIMEOUT_SECONDS,
+    ) -> None:
+        self.scewin_dir = find_scewin(scewin_dir)
+        self._run = run
+        self._admin_check = admin_check
+        self.timeout = timeout
+        self.import_timeout = import_timeout
+
+    @property
+    def exe_path(self) -> Path:
+        return self.scewin_dir / SCEWIN_EXE
+
+    def export(self, script_path: Path) -> SCEWINResult:
+        script_path = Path(script_path).resolve()
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        if script_path.is_file():
+            # SCEWIN overwrites the file; keep what was there (hand edits) as <name>.bak.
+            shutil.copy2(script_path, script_path.with_name(script_path.name + ".bak"))
+        result = self._execute("export", ["/o", "/s", str(script_path)], script_path)
+
+        created = False
+        restore_point = restore_point_path(script_path)
+        if result.ok and script_path.is_file() and not restore_point.exists():
+            shutil.copy2(script_path, restore_point)
+            created = True
+        if created:
+            result = replace(result, restore_point_created=True)
+        return result
+
+    def snapshot(self, script_path: Path) -> Path:
+        """Read the live BIOS into ``<name>.preimport<ext>``: the baseline for the next import.
+
+        Reading never changes the BIOS. The diff, the risk check and the integrity checks
+        then compare against what the BIOS holds *now*, not against an export that may be
+        weeks old. If no restore point exists yet, this snapshot becomes it. The file is
+        overwritten by the next snapshot, so it is also the undo for the latest import.
+        """
+
+        script_path = Path(script_path).resolve()
+        target = script_path.with_name(f"{script_path.stem}.preimport{script_path.suffix}")
+        result = self._execute("snapshot", ["/o", "/s", str(target)], script_path)
+        if not result.ok or not target.is_file():
+            lines = "\n".join(result.summary_lines())
+            raise SCEWINError(f"Could not read the current BIOS settings, so nothing was imported.\n{lines}")
+        restore_point = restore_point_path(script_path)
+        if not restore_point.exists():
+            shutil.copy2(target, restore_point)
+        return target
+
+    def _resolve_baseline(self, script_path: Path, baseline: Optional[Path]) -> Optional[Path]:
+        candidate = Path(baseline) if baseline is not None else restore_point_path(script_path)
+        return candidate if candidate.is_file() else None
+
+    def check_import(self, script_path: Path, baseline: Optional[Path] = None) -> List[str]:
+        """Return preflight problems for a script (empty list means it may be imported).
+
+        ``baseline`` is the file to compare against (normally :meth:`snapshot`); it defaults
+        to the restore point. Without any baseline the import is refused: nothing could say
+        what it would change.
+        """
+
+        script_path = Path(script_path)
+        if not script_path.is_file():
+            return [f"Script file '{script_path}' does not exist."]
+        text = _read_text(script_path)
+        issues = preflight_issues(text)
+
+        reference = self._resolve_baseline(script_path, baseline)
+        if reference is None:
+            issues.append(
+                "There is nothing to compare this file with (no restore point and no snapshot of the "
+                "current BIOS), so the changes cannot be checked. Run 'export' first."
+            )
+        elif reference.resolve() != script_path.resolve():
+            original = _read_text(reference)
+            mismatch = crc_header_mismatch(original, text)
+            if mismatch:
+                hint = (
+                    f"If you updated the BIOS, delete '{restore_point_path(script_path).name}' and export again."
+                    if reference == restore_point_path(script_path)
+                    else "Export again from the current BIOS."
+                )
+                issues.append(f"{mismatch} {hint}")
+            missing = missing_questions(original, text)
+            if missing:
+                shown = ", ".join(f"'{name}'" for name in missing[:3])
+                more = f" and {len(missing) - 3} more" if len(missing) > 3 else ""
+                issues.append(
+                    f"{len(missing)} question(s) from your original export are gone from this file ({shown}{more}). "
+                    "It may be truncated or damaged. (Commenting a question out with // is fine.)"
+                )
+            altered = structural_changes(original, text)
+            if altered:
+                shown = "; ".join(altered[:3])
+                more = f" (and {len(altered) - 3} more)" if len(altered) > 3 else ""
+                issues.append(
+                    f"{len(altered)} question(s) differ in more than the selected option or number: {shown}{more}. "
+                    "This tool only changes those; if the BIOS changed since the file was exported, export again."
+                )
+        return issues
+
+    def changes_since_export(
+        self, script_path: Path, baseline: Optional[Path] = None
+    ) -> Optional[List[SettingChange]]:
+        """Settings that differ from the baseline (default: the restore point), or None if there is none."""
+
+        script_path = Path(script_path)
+        reference = self._resolve_baseline(script_path, baseline)
+        if reference is None or not script_path.is_file():
+            return None
+        return diff_texts(_read_text(reference), _read_text(script_path))
+
+    def import_script(self, script_path: Path, baseline: Optional[Path] = None) -> SCEWINResult:
+        script_path = Path(script_path).resolve()
+        issues = self.check_import(script_path, baseline)
+        if issues:
+            raise SCEWINError("Import blocked by preflight checks:\n- " + "\n- ".join(issues))
+        return self._execute("import", ["/i", "/s", str(script_path)], script_path)
+
+    def restore(self, script_path: Path) -> SCEWINResult:
+        restore_point = restore_point_path(Path(script_path).resolve())
+        if not restore_point.is_file():
+            raise SCEWINError(
+                f"No restore point found at '{restore_point}'. It is created by the first export."
+            )
+        return replace(self.import_script(restore_point, baseline=restore_point), action="restore")
+
+    def _execute(self, action: str, args: Sequence[str], script_path: Path) -> SCEWINResult:
+        if not self._admin_check():
+            raise SCEWINError("SCEWIN needs administrator rights. Re-run nvram-tweaker as administrator.")
+
+        command = [str(self.exe_path), *args]
+        writes = action == "import"
+        timeout = self.import_timeout if writes else self.timeout
+        extra = _window_options(os.name == "nt")
+        try:
+            completed = self._run(
+                command,
+                cwd=str(self.scewin_dir),
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=timeout,
+                stdin=subprocess.DEVNULL,  # SCEWIN must never wait for a keypress nobody can give
+                **extra,
+            )
+        except FileNotFoundError as exc:
+            raise SCEWINError(f"Could not start {self.exe_path}: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            if writes:
+                raise SCEWINError(
+                    f"SCEWIN was stopped after {timeout} seconds while writing to the BIOS. "
+                    f"{PARTIAL_WRITE_WARNING}"
+                ) from exc
+            raise SCEWINError(f"SCEWIN did not finish within {timeout} seconds.") from exc
+        except OSError as exc:
+            raise SCEWINError(f"Could not run SCEWIN: {exc}") from exc
+
+        output = (completed.stdout or "") + (completed.stderr or "")
+        log_path = script_path.with_name(LOG_FILE_NAME)
+        log_path.write_text(output, encoding="utf-8")
+        return SCEWINResult(
+            action=action,
+            command=command,
+            returncode=completed.returncode,
+            output=output,
+            log_path=log_path,
+            diagnoses=diagnose(output),
+        )
+
+
+CREATE_NO_WINDOW = 0x08000000  # subprocess.CREATE_NO_WINDOW exists on Windows only
+
+
+def _window_options(is_windows: bool) -> dict:
+    """Extra ``subprocess.run`` options. The GUI exe has no console: without CREATE_NO_WINDOW
+    Windows flashes a console window for every SCEWIN call. (Not valid on other systems.)"""
+
+    return {"creationflags": CREATE_NO_WINDOW} if is_windows else {}
+
+
+def _read_text(path: Path) -> str:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        text = path.read_text(encoding="latin-1")
+    return text.replace("\r\n", "\n")
+
+
+def _print_changes(changes: Optional[List[SettingChange]]) -> List[str]:
+    """Print the diff against the restore point; return the confirm-level changes."""
+
+    if changes is None:
+        print("No restore point found, so the changes cannot be listed. Export first to create one.")
+        return []
+    if not changes:
+        print("No settings differ from the restore point.")
+        return []
+    print(f"{len(changes)} setting(s) differ from the restore point:")
+    for change in changes:
+        print(f"  - {change.format()}")
+    return [change.format() for change in changes if change.risk_keywords]
+
+
+def add_subcommands(sub: "argparse._SubParsersAction") -> None:
+    """Register export / import / restore / diagnose on an argparse sub-parser group."""
+
+    def add_common(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--scewin", type=Path, help="Folder with SCEWIN_64.exe and its drivers")
+        p.add_argument("--file", type=Path, default=Path(DEFAULT_SCRIPT_NAME), help="NVRAM script path")
+
+    add_common(sub.add_parser("export", help="Export the current BIOS settings with SCEWIN"))
+    import_parser = sub.add_parser("import", help="Write the script file to the BIOS with SCEWIN")
+    add_common(import_parser)
+    import_parser.add_argument("--yes", action="store_true", help="Skip the Y/N question (scripts)")
+    import_parser.add_argument(
+        "--allow-risky", action="store_true", help="Confirm changes to risky settings without asking (scripts)"
+    )
+    import_parser.add_argument(
+        "--no-snapshot",
+        action="store_true",
+        help="Do not read the live BIOS first; compare with the restore point instead",
+    )
+    restore_parser = sub.add_parser("restore", help="Re-import the untouched copy saved by the first export")
+    add_common(restore_parser)
+    restore_parser.add_argument("--yes", action="store_true", help="Skip the Y/N question (scripts)")
+    diagnose_parser = sub.add_parser("diagnose", help="Explain an existing SCEWIN log file")
+    diagnose_parser.add_argument("log", type=Path, help="Path to log-file.txt")
+
+
+def run(
+    args: argparse.Namespace,
+    *,
+    interactive: Optional[bool] = None,
+    ask: Callable[[str], str] = input,
+) -> int:
+    """Run one of the commands registered by :func:`add_subcommands`."""
+
+    if args.command == "diagnose":
+        try:
+            diagnoses = diagnose(_read_text(args.log))
+        except OSError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if not diagnoses:
+            print("No known SCEWIN messages found in this log.")
+        for diagnosis in diagnoses:
+            print(diagnosis.format())
+        if diagnoses:
+            print(f"More help: {REFERENCE_URL}")
+        return 1 if has_errors(diagnoses) else 0
+
+    try:
+        scewin_dir = args.scewin or guess_scewin_dir(default_scewin_candidates())
+        if scewin_dir is None:
+            raise SCEWINError("Could not find a SCEWIN folder. Pass it with --scewin.")
+        runner = SCEWINRunner(scewin_dir)
+
+        if args.command == "export":
+            result = runner.export(args.file)
+        elif args.command == "import":
+            baseline = None
+            if not args.no_snapshot:
+                baseline = runner.snapshot(args.file)
+                print(f"Read the current BIOS settings into {baseline.name} (compared against, and your undo).")
+            issues = runner.check_import(args.file, baseline)
+            if issues:
+                raise SCEWINError("Import blocked by preflight checks:\n- " + "\n- ".join(issues))
+            risky_lines = _print_changes(runner.changes_since_export(args.file, baseline))
+            if not confirm_write(
+                "Write these settings to the BIOS now?",
+                risky_lines=risky_lines,
+                yes=args.yes,
+                allow_risky=args.allow_risky,
+                interactive=interactive,
+                ask=ask,
+            ):
+                return 1
+            result = runner.import_script(args.file, baseline=baseline)
+        else:
+            if not confirm_write(
+                "Re-import the original export and undo all changes?",
+                yes=args.yes,
+                interactive=interactive,
+                ask=ask,
+            ):
+                return 1
+            result = runner.restore(args.file)
+    except SCEWINError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    for line in result.summary_lines():
+        print(line)
+    return 0 if result.ok else 1
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Stand-alone entry point; ``nvram_tweaker_cli.py`` offers the same commands plus list/show/set."""
+
+    parser = argparse.ArgumentParser(description="Export, import or restore BIOS settings with SCEWIN.")
+    add_subcommands(parser.add_subparsers(dest="command", required=True))
+    return run(parser.parse_args(argv))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

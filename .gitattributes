@@ -1,0 +1,2 @@
+# Real SCEWIN exports use CRLF plus odd "\r\r\n" endings. Never let git rewrite them.
+tests/fixtures/** -text

@@ -1,0 +1,102 @@
+name: Test and build
+
+# Every push and pull request runs the tests on Windows and Linux (Python 3.10 and
+# 3.12) and builds NVRAM_Tweaker.exe from this exact commit. Pushing a tag such as
+# v2.0.0 also publishes a GitHub release with the exe and its SHA-256 checksum, so
+# anyone can verify that a downloaded exe came from this workflow. The tag must
+# match nvram_version.py or the build fails.
+#
+# Dependencies come from requirements-build.txt only (exact versions, SHA-256
+# hashes, installed with --require-hashes). Regenerate it from
+# requirements-build.in when you want to upgrade something.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install libraries the GUI tests need (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb libgl1 libx11-6 libxrandr2 libxinerama1 libxcursor1 libxi6
+      - run: python -m pip install --require-hashes -r requirements-build.txt
+      - name: Tests (Windows)
+        if: runner.os == 'Windows'
+        run: python -m pytest -q
+      - name: Tests (Linux, virtual display)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m pytest -q
+
+  build:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Tag must match the version in nvram_version.py
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = (python -c "from nvram_version import __version__; print(__version__)").Trim()
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "Tag $env:GITHUB_REF_NAME does not match nvram_version.py ($version). Bump the version, commit, and tag again."
+          }
+      - run: python -m pip install --require-hashes -r requirements-build.txt
+      - run: python scripts/fetch_fonts.py
+      - run: python -m PyInstaller --clean --noconfirm nvram_tweaker.spec
+      - name: Write checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist/NVRAM_Tweaker.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  NVRAM_Tweaker.exe" | Out-File -Encoding ascii dist/SHA256SUMS.txt
+          Get-Content dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: NVRAM_Tweaker
+          path: |
+            dist/NVRAM_Tweaker.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: NVRAM_Tweaker
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release create "$TAG" dist/NVRAM_Tweaker.exe dist/SHA256SUMS.txt \
+            --repo "$REPO" --title "$TAG" --generate-notes --verify-tag

@@ -1,0 +1,166 @@
+// Script File Name : nvram.txt
+// Created on 05/13/26 at 16:51:17    
+// AMISCE Utility. Ver 5.05.01.0002
+// Copyright (c) 2021 AMI. All rights reserved.
+HIICrc32= F1F3871C
+
+Setup Question	= CPU Revision
+Help String	= 0-Bristol, 1-Summit, 2-Raven, 3-Pinnacle
+Token	=02	// Do NOT change this line
+Offset	=00
+Width	=01
+Options	=[00]0	// Move "*" to the desired Option
+         [01]1
+         [02]2
+         [03]3
+         *[04]1
+
+Setup Question	= Special Display Features
+Help String	= Enable/Disable          PowerXpress             HybridGraphics
+Token	=7D1	// Do NOT change this line
+Offset	=02
+Width	=01
+Options	=*[00]Disabled	// Move "*" to the desired Option
+         [03]PowerXpress
+         [04]HybridGraphics
+
+Setup Question	= PX Dynamic Mode
+Help String	= Enable/Disable PX Dynamic Mode Switch
+Token	=03	// Do NOT change this line
+Offset	=03
+Width	=01
+Options	=*[00]Disabled	// Move "*" to the desired Option
+         [01]dGPU Power Down
+         [02]PX ULPS Mode
+
+Setup Question	= Primary Video Adaptor
+Help String	= Select Internal/External Graphics
+Token	=04	// Do NOT change this line
+Offset	=04
+Width	=01
+Options	=[01]Int Graphics (IGD)	// Move "*" to the desired Option
+         *[02]Ext Graphics (PEG)
+
+// Setup Question	= PCIe/GFX Lanes Configuration
+// Help String	= Configure J10 & J3600 Slot PCIe Lanes. x16 - J10: x16, J3600: NA; x8x8 - J10: x8, J3600: x8; x8x4x4 - J10: x8, J3600: 4x4; x4x4x4x4 - J10: x4x4x4x4, J3600: NA.
+// Token	=0A	// Do NOT change this line
+// Offset	=0D
+// Width	=01
+// Options	=*[00]x16	// Move "*" to the desired Option
+//         [01]x8x8
+//         [02]x8x4x4
+
+Setup Question	= PCIe/GFX Lanes Configuration
+Help String	= Configure J10 Slot PCIe Lanes. x8 - J10: x8; x4x4 - J10: x4x4.
+Token	=0B	// Do NOT change this line
+Offset	=0E
+Width	=01
+Options	=*[00]x8	// Move "*" to the desired Option
+         [01]x4x4
+
+Setup Question	= SataExpress/M.2 PCIe Switch
+Help String	= (SataExpress): M.2 x2 and Sata Express x2.  (M.2 Pcie): M.2 x4
+Token	=0C	// Do NOT change this line
+Offset	=0F
+Width	=01
+Options	=*[00]SataExpress	// Move "*" to the desired Option
+         [01]M.2 PCIe
+
+Setup Question	= Adjust APU VDDP Value
+Help String	= Adjust APU VDDP, stepping is 2mV. Vddp = 1.05V +/- N * 2 mV, input rang is 0-31. Tunning range is +/- 60 mV
+Token	=13	// Do NOT change this line
+Offset	=1B
+Width	=01
+Value	=<0>
+
+Setup Question	=   Adjust VID Value
+Help String	= Adjust VID Value (mv), [0-800]
+Token	=18	// Do NOT change this line
+Offset	=5E
+Width	=02
+Value	=<0>
+
+Setup Question	= SataRedrv Com Option1 Address
+Help String	= SataRedrv Com Option1 Address
+Token	=23	// Do NOT change this line
+Offset	=38
+Width	=01
+Value	=0
+
+Setup Question	= Current VDDIO Value (mV)
+Help String	= Current VDDIO Value (mV)
+Token	=11	// Do NOT change this line
+Offset	=C7
+Width	=04
+Value	=<0>
+
+Setup Question	= VDDIO Voltage Control
+Help String	= Adjust MEM VDDIO, stepping is 4mV. VddIo = 1.2V +/- N * 4 mV, input rang is 0-31. Tunning range is +/- 120 mV   The Stepping is 13mV on Turpan.
+Token	=7D1	// Do NOT change this line
+Offset	=C2
+Width	=01
+Options	=*[00]Disabled	// Move "*" to the desired Option
+         [01]Increase VDDIO
+         [02]Decrease VDDIO
+
+Setup Question	= Trcpage
+Help String	= SDRAM Optional Features (tMAW, MAC). Valid value 3FFh - 0h
+Token	=3C	// Do NOT change this line
+Offset	=5A
+Width	=02
+Value	=0
+
+Setup Question	= Custom Pstate0
+Help String	= Disable - disable this Pstate  Custom - customize this Pstate, applicable only if PcdOcDisable=FALSE    WARNING - DAMAGE CAUSED BY USE OF YOUR AMD PROCESSOR OUTSIDE OF SPECIFICATION OR IN EXCESS OF FACTORY SETTINGS ARE NOT COVERED UNDER YOUR AMD PRODUCT WARRANTY AND MAY NOT BE COVERED BY YOUR SYSTEM MANUFACTURER'S WARRANTY.  Operating your AMD processor outside of specification or in excess of factory settings, including but not limited to overclocking, may damage or shorten the life of your processor or other system components, create system instabilities (e.g., data loss and corrupted images) and in extreme cases may result in total system failure. AMD does not provide support or service for issues or damages related to use of an AMD processor outside of processor specifications or in excess of factory settings.  
+Token	=7011	// Do NOT change this line
+Offset	=3A
+Width	=01
+Options	=[01]Custom	// Move "*" to the desired Option
+         *[02]Auto
+
+Setup Question	= CAKE CRC perf bounds
+Help String	= Specify the amount of performance loss that is acceptable to enable CRC protection.  Units are in 0.00001%, Range: disabled (0) - 10% (1000000).
+Token	=50	// Do NOT change this line
+Offset	=CC
+Width	=04
+Value	=64
+
+Setup Question	= XHCI Controller0 enable
+Help String	= Enable or disable USB3 controller.
+Token	=1C1	// Do NOT change this line
+Offset	=1BC
+Width	=01
+Options	=[01]Enabled	// Move "*" to the desired Option
+         [00]Disabled
+         *[0F]Auto
+
+Setup Question	=   AMD fTPM switch
+Help String	= Enables or disables the AMD CPU fTPM function.
+Token	=16	// Do NOT change this line
+Offset	=2B
+Width	=01
+BIOS Default	=[00]AMD CPU fTPM 
+Options	=*[00]AMD CPU fTPM	// Move "*" to the desired Option
+         [01]AMD CPU fTPM Disabled
+
+Setup Question	= BIOS CSM/UEFI Mode
+Help String	= Select CSM or UEFI for running specify operating system support.
+Token	=2772	// Do NOT change this line
+Offset	=139
+Width	=01
+BIOS Default	=[00]CSM 
+Options	=*[00]CSM	// Move "*" to the desired Option
+         [01]UEFI
+
+Setup Question	=   ASPM Mode Control
+Help String	= NB Root Port ASPM Mode Control
+Token	=196	// Do NOT change this line
+Offset	=110
+Width	=01
+BIOS Default	=[00]Disabled 
+Options	=*[00]Disabled	// Move "*" to the desired Option
+         [01]L0s Entry
+         [02]L1 Entry
+         [03]L0s And L1 Entry
+         [FF]Auto
+

@@ -3,7 +3,6 @@ from pathlib import Path
 
 import pytest
 
-import nvram_crc
 import nvram_editor
 import nvram_parsing
 import nvram_reconstruction
@@ -75,55 +74,17 @@ def test_parse_and_rebuild_round_trip_preserves_formatting() -> None:
     assert rebuilt == mixed_format
 
 
-def test_crc_bypass_modes_apply_expected_changes() -> None:
-    sample_content = "HIICrc32=live,ver=02\nSetup Question = Test\nValue = <1>\n"
-    placeholder = nvram_crc.recalculate_crc(
-        sample_content, "HIICrc32=original,ver=01", bypass=True, bypass_mode="placeholder", tool_version="1.0"
-    )
-    first_line = placeholder.splitlines()[0]
-    assert "<bypassed by nvram-tweaker" in first_line
-    assert first_line.endswith(",ver=02")
-
-    emptied = nvram_crc.recalculate_crc(sample_content, "HIICrc32=original,ver=01", bypass=True, bypass_mode="empty")
-    assert emptied.splitlines()[0] == "HIICrc32="
-
-    removed = nvram_crc.recalculate_crc(sample_content, "HIICrc32=original,ver=01", bypass=True, bypass_mode="remove")
-    assert not removed.startswith("HIICrc32=")
-
-
-def test_save_blocks_unsafe_crc_bypass_by_default(tmp_path: Path) -> None:
-    content = "HIICrc32=abcd\nSetup Question = First\nValue = <1>\n"
+def test_save_never_modifies_crc_header(tmp_path: Path) -> None:
+    content = "HIICrc32= 5B2C3F1A\nSetup Question = First\nValue = <1>\n"
     path = tmp_path / "nvram.txt"
     path.write_text(content)
 
     manager = nvram_editor.NVRAMManager().load_file(path)
-    new_text = manager.rebuild_text()
+    updated_block = manager.update_value(manager.blocks[0], 7)
+    manager.save(path, manager.rebuild_text([updated_block]))
 
-    with pytest.raises(ValueError, match="Unsafe CRC bypass blocked"):
-        manager.save(path, new_text, bypass_crc=True, bypass_crc_mode="remove")
-
-    assert path.read_text() == content
-
-
-def test_save_allows_forced_crc_bypass(tmp_path: Path) -> None:
-    content = "HIICrc32=abcd\nSetup Question = First\nValue = <1>\n"
-    path = tmp_path / "nvram.txt"
-    path.write_text(content)
-
-    manager = nvram_editor.NVRAMManager().load_file(path)
-    new_text = manager.rebuild_text()
-
-    manager.save(
-        path,
-        new_text,
-        bypass_crc=True,
-        bypass_crc_mode="empty",
-        force_crc_bypass=True,
-    )
-
-    updated = path.read_text().splitlines()
-    assert updated[0] == "HIICrc32="
-    assert (tmp_path / "nvram.txt.bak").exists()
+    assert path.read_text() == "HIICrc32= 5B2C3F1A\nSetup Question = First\nValue = <7>\n"
+    assert (tmp_path / "nvram.txt.bak").read_text() == content
 
 
 def test_save_preserves_batch_edits(tmp_path: Path) -> None:
@@ -198,7 +159,7 @@ def test_apply_changes_rejects_out_of_range_value(tmp_path: Path) -> None:
     ],
 )
 def test_validate_numeric_input_accepts_valid_values(raw: str, expected: int, conversion_note: str) -> None:
-    parsed, note = nvram_editor.validate_numeric_input(raw)
+    parsed, note = nvram_parsing.validate_numeric_input(raw)
     assert parsed == expected
     assert note == conversion_note
 
@@ -209,4 +170,4 @@ def test_validate_numeric_input_accepts_valid_values(raw: str, expected: int, co
 )
 def test_validate_numeric_input_rejects_invalid_values(raw: str) -> None:
     with pytest.raises(ValueError):
-        nvram_editor.validate_numeric_input(raw)
+        nvram_parsing.validate_numeric_input(raw)

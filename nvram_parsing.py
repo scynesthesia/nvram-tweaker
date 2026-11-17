@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from nvram_structures import BlockField, OptionField, QuestionBlock, ValueField
 
@@ -38,18 +38,54 @@ TOKEN_PATTERN = re.compile(
     r"^\s*(?:[#;/]{0,2}\s*)?Token\s*=\s*(?P<token>.+)",
     re.MULTILINE,
 )
-VALUE_PATTERN = re.compile(r"Value\s*=\s*<(?P<value>[+-]?(?:0x[0-9A-Fa-f]+|\d+))>\s*")
+_NUMBER = r"[+-]?(?:0x[0-9A-Fa-f]+|\d+)"
+# A live numeric line. Real exports use both ``Value =<30>`` and the bare ``Value =0``;
+# the value group is only the number, so edits keep everything else on the line.
+# Anchored to the line start so a commented-out ``// Value =<1>`` is never matched.
+VALUE_PATTERN = re.compile(
+    r"^[ \t]*Value[ \t]*=[ \t]*(?P<open><)?(?P<value>" + _NUMBER + r")(?(open)>)",
+    re.MULTILINE,
+)
+# A live option line. Lines starting with a comment marker are not options.
 OPTION_LINE_PATTERN = re.compile(
-    r"(?P<prefix>\s*(?:[#;/]{0,2}\s*)?(?:Options?|Option)?\s*=?\s*)?"
+    r"(?P<prefix>\s*(?:Options?)?\s*=?\s*)?"
     r"(?P<star>\*)?\[(?P<code>[^\]]+)\](?P<label>.+)"
 )
-MIN_PATTERN = re.compile(r"\bMin\s*=\s*(?P<min>-?(?:0x[0-9A-Fa-f]+|\d+))", re.IGNORECASE)
-MAX_PATTERN = re.compile(r"\bMax\s*=\s*(?P<max>-?(?:0x[0-9A-Fa-f]+|\d+))", re.IGNORECASE)
+MIN_PATTERN = re.compile(r"^[ \t]*Min[ \t]*=[ \t]*(?P<min>-?(?:0x[0-9A-Fa-f]+|\d+))", re.IGNORECASE | re.MULTILINE)
+MAX_PATTERN = re.compile(r"^[ \t]*Max[ \t]*=[ \t]*(?P<max>-?(?:0x[0-9A-Fa-f]+|\d+))", re.IGNORECASE | re.MULTILINE)
+# ``Width =01`` is the storage size in bytes (hex digits, like ``Offset``).
+WIDTH_PATTERN = re.compile(r"^[ \t]*Width[ \t]*=[ \t]*(?P<width>[0-9A-Fa-f]+)", re.MULTILINE)
 TOKEN_VALIDATION_PATTERN = re.compile(
     r"^(0x[0-9A-Fa-f]+|[0-9A-Fa-f]+)(\s*,\s*(0x[0-9A-Fa-f]+|[0-9A-Fa-f]+))*$"
 )
 NUMERIC_INPUT_PATTERN = re.compile(r"^[+-]?(?:0x[0-9A-Fa-f]+|\d+)$")
 SETUP_BOUNDARY_PATTERN = re.compile(r"setup\s+question", re.IGNORECASE)
+
+
+def parse_number(raw: str) -> int:
+    """Parse a SCEWIN number: decimal (leading zeros allowed) or ``0x`` hexadecimal."""
+
+    cleaned = raw.strip()
+    if "x" in cleaned.lower():
+        return int(cleaned, 16)
+    return int(cleaned, 10)
+
+
+def normalize_token(raw: str) -> str:
+    """Canonical form of a token so ``7D1``, ``0x7d1`` and ``007D1`` compare equal.
+
+    Tokens are hexadecimal as printed in the export (``Token =7D1``); a token may
+    also be a comma-separated list. Raises ``ValueError`` if it is not hex.
+    """
+
+    parts = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            parts.append(f"{int(part, 16):X}")
+    if not parts:
+        raise ValueError("empty token")
+    return ",".join(parts)
 
 
 def find_blocks(text: str) -> tuple[List[QuestionBlock], str]:
@@ -92,6 +128,8 @@ def find_blocks(text: str) -> tuple[List[QuestionBlock], str]:
         max_match = MAX_PATTERN.search(body)
         min_value = _parse_range_value(min_match, "min")
         max_value = _parse_range_value(max_match, "max")
+        width = _parse_width(WIDTH_PATTERN.search(body))
+        is_commented = header_without_leading[:1] in ("#", ";", "/")
         cursor = match.end()
         cleaned_token: Optional[str] = None
         if token_match:
@@ -109,16 +147,15 @@ def find_blocks(text: str) -> tuple[List[QuestionBlock], str]:
                 token=cleaned_token,
                 min_value=min_value,
                 max_value=max_value,
-                start=match.start(),
-                end=match.end(),
                 line_number=line_number,
                 pre_separator=pre_separator,
-                post_separator="",
                 setup_line=header_core,
                 line_ending=match.group("header_ending"),
                 leading_whitespace=leading_whitespace,
                 inline_comment=inline_comment,
                 fields=fields,
+                is_commented=is_commented,
+                width=width,
             )
         )
     trailing_text = text[cursor:]
@@ -134,8 +171,16 @@ def _extract_leading_whitespace(line: str) -> str:
 
 
 def _split_inline_comment(line: str) -> tuple[str, str]:
-    comment_match = re.search(r"(\s*(?:[#;/]{1,2}.*))$", line)
-    if not comment_match or comment_match.start(1) == 0:
+    """Split a trailing ``// ...``, ``; ...`` or ``# ...`` comment off a header line.
+
+    SCEWIN itself only writes ``//`` comments. A marker only starts a comment when
+    whitespace comes before it, and ``#`` / ``;`` also need whitespace after them.
+    Question names contain these characters ("PCIe/GFX Lanes",
+    "Clock Power Management(CLKREQ#)", "Boot Option #1") and must not be cut short.
+    """
+
+    comment_match = re.search(r"(\s+(?://.*|[#;](?:\s.*)?))$", line)
+    if not comment_match:
         return line, ""
     start_index = comment_match.start(1)
     return line[:start_index], comment_match.group(1)
@@ -162,11 +207,20 @@ def _parse_range_value(match: Optional[re.Match[str]], group_name: str) -> Optio
     if not match:
         return None
 
-    raw_value = match.group(group_name)
     try:
-        return int(raw_value, 0)
+        return parse_number(match.group(group_name))
     except ValueError:
         return None
+
+
+def _parse_width(match: Optional[re.Match[str]]) -> Optional[int]:
+    if not match:
+        return None
+    try:
+        width = int(match.group("width"), 16)
+    except ValueError:
+        return None
+    return width if width > 0 else None
 
 
 def _clean_token(raw_token: str) -> str:
@@ -204,7 +258,7 @@ def _parse_fields(body: str) -> List[BlockField]:
         if value_match:
             fields.append(
                 ValueField(
-                    value=int(value_match.group("value"), 0),
+                    value=parse_number(value_match.group("value")),
                     line_ending="\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else ""),
                 )
             )
@@ -228,7 +282,7 @@ def validate_numeric_input(raw_value: str) -> tuple[int, Optional[str]]:
     if not NUMERIC_INPUT_PATTERN.fullmatch(cleaned):
         raise ValueError("Invalid value format: use decimal digits or 0x-prefixed hexadecimal.")
 
-    parsed_value = int(cleaned, 0)
+    parsed_value = parse_number(cleaned)
     conversion_note: Optional[str] = None
     lower_cleaned = cleaned.lower()
     if lower_cleaned.startswith("0x") or lower_cleaned.startswith("+0x") or lower_cleaned.startswith("-0x"):

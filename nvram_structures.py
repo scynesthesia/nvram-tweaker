@@ -16,9 +16,6 @@ class ValueField:
     value: int
     line_ending: str = "\n"
 
-    def render(self) -> str:
-        return f"Value = <{self.value}>{self.line_ending}"
-
 
 @dataclass(frozen=True)
 class OptionField:
@@ -29,10 +26,6 @@ class OptionField:
     label: str
     selected: bool
     line_ending: str = "\n"
-
-    def render(self) -> str:
-        marker = "*" if self.selected else ""
-        return f"{self.prefix}{marker}[{self.code}]{self.label}{self.line_ending}"
 
     def toggle(self, make_selected: bool) -> "OptionField":
         return replace(self, selected=make_selected)
@@ -51,16 +44,35 @@ class QuestionBlock:
     token: str | None
     min_value: int | None
     max_value: int | None
-    start: int
-    end: int
     line_number: int
     pre_separator: str
-    post_separator: str
     setup_line: str
     line_ending: str
     leading_whitespace: str
     inline_comment: str
     fields: List[BlockField]
+    # SCEWIN comments out whole questions that are inactive on this system (often a
+    # twin of a live question with the same name). They are kept so the file
+    # rebuilds exactly, but they are not settings and must never be edited.
+    is_commented: bool = False
+    # Storage size in bytes from the ``Width =`` line (None when absent).
+    width: int | None = None
+
+    def value_bounds(self) -> tuple[int | None, int | None]:
+        """Smallest and largest value this question accepts.
+
+        Explicit ``Min``/``Max`` lines win. Real exports have none, so the storage
+        ``Width`` (bytes, unsigned) supplies the limits instead: 0..255 for
+        ``Width=01``, 0..65535 for ``Width=02`` and so on.
+        """
+
+        low, high = self.min_value, self.max_value
+        if self.width:
+            if low is None:
+                low = 0
+            if high is None:
+                high = 256**self.width - 1
+        return low, high
 
     def with_body(self, new_body: str) -> "QuestionBlock":
         return replace(self, body=new_body)
